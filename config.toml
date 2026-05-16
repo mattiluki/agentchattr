@@ -39,6 +39,7 @@ label = "Qwen"
 mcp_inject = "settings_file"
 mcp_settings_path = ".qwen/settings.json"
 mcp_transport = "http"
+mcp_merge_project = true  # LosAgentOS C6 Phase A2 -- pick up vault MCP from ~/Documents/.mcp.json
 inject_delay = 1.0
 
 [agents.kilo]

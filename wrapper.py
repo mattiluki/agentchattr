@@ -36,10 +36,13 @@ SERVER_NAME = "agentchattr"
 # ---------------------------------------------------------------------------
 
 def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http",
-                              *, token: str = "") -> Path:
+                              *, token: str = "", project_servers: dict | None = None) -> Path:
     """Write/merge a settings-style JSON file with nested mcpServers config.
 
     Preserves existing servers in the file — only updates the agentchattr entry.
+    If project_servers is provided (typically the merged contents of a project's
+    .mcp.json), those entries are also merged in alongside; the agentchattr
+    entry takes precedence on key conflict.
 
     Gemini CLI 0.32+ expects:
       - "httpUrl" key (not "url") for streamable-http transport
@@ -54,6 +57,13 @@ def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http
         except Exception:
             pass
     servers = existing.get("mcpServers", {})
+    # Merge project servers first so the agentchattr entry overrides on conflict.
+    # _read_project_mcp_servers already strips its own SERVER_NAME entry, so
+    # the `if k != SERVER_NAME` here is just defensive belt-and-suspenders.
+    if project_servers:
+        for k, v in project_servers.items():
+            if k != SERVER_NAME:
+                servers[k] = v
     # Gemini CLI uses "httpUrl" for streamable-http, "url" for SSE
     if transport in ("http", "streamable-http"):
         entry: dict = {"type": "http", "httpUrl": url, "trust": True}
@@ -132,20 +142,24 @@ _BUILTIN_DEFAULTS: dict[str, dict] = {
         "mcp_inject": "env",
         "mcp_env_var": "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
         "mcp_transport": "http",  # streamable-http; SSE has blocking issues in Gemini 0.32.x
+        "mcp_merge_project": True,  # LosAgentOS C6 Phase A2 -- pick up vault MCP from project .mcp.json
     },
     "codex": {
         "mcp_inject": "proxy_flag",
         "mcp_proxy_flag_template": '-c mcp_servers.{server}.url="{url}"',
+        # proxy_flag mode cannot carry multiple servers; codex is Phase A2b
     },
     "kimi": {
         "mcp_inject": "flag",
         "mcp_flag": "--mcp-config-file",
         "mcp_transport": "http",
+        "mcp_merge_project": True,  # LosAgentOS C6 Phase A2 -- same as claude
     },
     "kilo": {
         "mcp_inject": "env_content",
         "mcp_env_var": "KILO_CONFIG_CONTENT",
         "mcp_transport": "http",
+        "mcp_merge_project": True,  # LosAgentOS C6 Phase A2 -- but kilo expects HTTP entries; stdio servers may not work
     },
 }
 
@@ -199,6 +213,15 @@ def _apply_mcp_inject(
     transport = inject_cfg.get("mcp_transport", "http")
     server_url = _get_server_url(mcp_cfg or {}, transport)
 
+    # Compute project_servers once -- shared by settings_file / env /
+    # env_content / flag modes when mcp_merge_project is enabled.
+    merge_project = inject_cfg.get("mcp_merge_project", False)
+    project_servers = (
+        _read_project_mcp_servers(project_dir)
+        if (merge_project and project_dir)
+        else {}
+    )
+
     if mode == "settings_file":
         # Write a settings JSON file at a user-specified path (e.g. .qwen/settings.json)
         raw_path = inject_cfg.get("mcp_settings_path", "")
@@ -209,7 +232,8 @@ def _apply_mcp_inject(
             base = Path(project_dir) if project_dir else Path.cwd()
             target = base / target
         settings_path = _write_json_mcp_settings(target, server_url,
-                                                  transport=transport, token=token)
+                                                  transport=transport, token=token,
+                                                  project_servers=project_servers)
         # Optionally set an env var pointing to the settings file
         env_var = inject_cfg.get("mcp_env_var")
         if env_var:
@@ -223,14 +247,14 @@ def _apply_mcp_inject(
         settings_path = _write_json_mcp_settings(
             config_dir / f"{instance_name}-settings.json",
             server_url, transport=transport, token=token,
+            project_servers=project_servers,
         )
         inject_env[env_var] = str(settings_path)
 
     elif mode == "flag":
-        # Write a config file, pass it as a CLI flag
+        # Write a config file, pass it as a CLI flag.
+        # NOTE: project_servers was computed up-top via mcp_merge_project.
         flag = inject_cfg.get("mcp_flag", "--mcp-config")
-        merge_project = inject_cfg.get("mcp_merge_project", False)
-        project_servers = _read_project_mcp_servers(project_dir) if (merge_project and project_dir) else {}
         settings_path = _write_claude_mcp_config(
             config_dir / f"{instance_name}-mcp.json",
             server_url, token=token, project_servers=project_servers,
@@ -246,7 +270,18 @@ def _apply_mcp_inject(
         entry: dict = {"type": "remote", "url": server_url, "enabled": True}
         if token:
             entry["headers"] = {"Authorization": f"Bearer {token}"}
-        payload = {"mcp": {SERVER_NAME: entry}}
+        # Start with project servers (if any) under the "mcp" key, then add
+        # agentchattr. Kilo's payload format is `{"mcp": {<name>: <entry>}}`;
+        # project servers are passed through as-is. Note: kilo's expected entry
+        # format is HTTP-style (type/url/headers); a stdio entry (command/args)
+        # from .mcp.json may not be honored by kilo today -- transport
+        # alignment is the user's responsibility.
+        mcp_servers: dict = {}
+        for k, v in project_servers.items():
+            if k != SERVER_NAME:
+                mcp_servers[k] = v
+        mcp_servers[SERVER_NAME] = entry
+        payload = {"mcp": mcp_servers}
         inject_env[env_var] = json.dumps(payload)
 
     elif mode == "proxy_flag":
