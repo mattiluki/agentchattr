@@ -2855,8 +2855,29 @@ function buildMentionToggles() {
 
     // Prune stale mentions for agents no longer in config
     for (const name of activeMentions) {
-        if (!(name in agentConfig)) activeMentions.delete(name);
+        if (!(name in agentConfig) && name !== 'all') activeMentions.delete(name);
     }
+
+    // AgentOS addition: @all chip — toggles every (non-pending) agent at once
+    const liveAgents = Object.entries(agentConfig).filter(([, c]) => c.state !== 'pending').map(([n]) => n);
+    const allBtn = document.createElement('button');
+    allBtn.className = 'mention-toggle mention-toggle-all';
+    allBtn.dataset.agent = 'all';
+    allBtn.textContent = '@all';
+    allBtn.title = `mention every agent (${liveAgents.length})`;
+    allBtn.style.setProperty('--agent-color', '#D97757');
+    const allActive = liveAgents.length > 0 && liveAgents.every(n => activeMentions.has(n));
+    if (allActive) allBtn.classList.add('active');
+    allBtn.onclick = () => {
+        if (liveAgents.every(n => activeMentions.has(n))) {
+            liveAgents.forEach(n => activeMentions.delete(n));
+        } else {
+            liveAgents.forEach(n => activeMentions.add(n));
+        }
+        buildMentionToggles();  // rebuild to reflect new state on all chips
+        updateSchedulePopoverState();
+    };
+    container.appendChild(allBtn);
 
     for (const [name, cfg] of Object.entries(agentConfig)) {
         if (cfg.state === 'pending') continue;  // skip pending instances
@@ -2877,6 +2898,12 @@ function buildMentionToggles() {
             } else {
                 activeMentions.add(name);
                 btn.classList.add('active');
+            }
+            // Refresh @all chip state in case it toggled into/out of "all-on"
+            const allBtn2 = container.querySelector('.mention-toggle-all');
+            if (allBtn2) {
+                const allOn = liveAgents.length > 0 && liveAgents.every(n => activeMentions.has(n));
+                allBtn2.classList.toggle('active', allOn);
             }
             updateSchedulePopoverState();
         };

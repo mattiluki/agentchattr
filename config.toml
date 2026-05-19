@@ -8,22 +8,28 @@ data_dir = "./data"
 # "command" is the CLI command (must be on PATH).
 
 [agents.claude]
-command = "claude"
+command = "/Users/zeroclaw/.local/bin/claude-with-model.sh"
 cwd = ".."
 color = "#da7756"
 label = "Claude"
+# AgentOS per-agent model selector: reads ~/agentos/.env.claude
+# Override per-launch with CLAUDE_MODEL=...
 
 [agents.codex]
-command = "codex"
+command = "/Users/zeroclaw/.local/bin/codex-with-model.sh"
 cwd = ".."
 color = "#10a37f"
 label = "Codex"
+# AgentOS per-agent model selector: reads ~/agentos/.env.codex
+# Override per-launch with CODEX_MODEL=...
 
 [agents.gemini]
-command = "gemini"
+command = "/Users/zeroclaw/.local/bin/gemini-fallback.sh"
 cwd = ".."
 color = "#4285f4"
 label = "Gemini"
+# AgentOS fallback wrapper: defaults to gemini-2.5-flash (high quota).
+# Override per-launch with: GEMINI_MODEL=gemini-2.5-pro
 
 [agents.kimi]
 command = "kimi"

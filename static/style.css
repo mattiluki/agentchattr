@@ -3484,6 +3484,15 @@ footer {
     color: var(--agent-color, var(--accent));
 }
 
+/* AgentOS: @all chip — dashed border + always-orange to distinguish from per-agent chips */
+.mention-toggle-all {
+    border-style: dashed;
+    font-weight: 700;
+}
+.mention-toggle-all.active {
+    background: color-mix(in srgb, var(--agent-color, var(--accent)) 25%, transparent);
+}
+
 #attachments {
     display: flex;
     gap: 8px;
