@@ -1,0 +1,216 @@
+diff --git a/serve.py b/serve.py
+index 6d7f0f5..c8f3aca 100644
+--- a/serve.py
++++ b/serve.py
+@@ -4026,6 +4026,7 @@ DEFAULT_API_KEY_NAMES = [
+     "FAL_KEY",
+     "KLING_API_KEY",
+ ]
++ENV_VALUE_TYPES = {"api_key", "env", "path", "url", "json_file"}
+ 
+ 
+ def _is_secret_env_key(key: str) -> bool:
+@@ -4087,6 +4088,7 @@ def _settings_env_rows() -> list[dict]:
+         rows.append({
+             "name": name,
+             "key": name,
++            "type": "api_key" if in_keychain else "env",
+             "masked_value": "(set in keychain)" if in_keychain else _mask_env_value(value),
+             "value": "(set in keychain)" if in_keychain else _mask_env_value(value),
+             "set": in_keychain or bool(value),
+@@ -4344,6 +4346,7 @@ async def settings_env_secret_put(payload: dict):
+     name = (payload.get("name") or payload.get("key") or "").strip().upper()
+     value = str(payload.get("value") or "")
+     action = (payload.get("action") or "set").strip().lower()
++    explicit_type = payload.get("type") is not None
+     value_type = (payload.get("type") or "api_key").strip().lower()
+     if not re.match(r"^[A-Z_][A-Z0-9_]*$", name):
+         return {"error": "env key must match ^[A-Z_][A-Z0-9_]*$"}
+@@ -4351,7 +4354,9 @@ async def settings_env_secret_put(payload: dict):
+         return {"error": "action must be set, add, unset, or delete"}
+     if value_type in ("api-key", "api key"):
+         value_type = "api_key"
+-    is_keychain_secret = value_type == "api_key" or _is_secret_env_key(name)
++    if value_type not in ENV_VALUE_TYPES:
++        return {"error": "type must be api_key, env, path, url, or json_file"}
++    is_keychain_secret = value_type == "api_key" or (not explicit_type and _is_secret_env_key(name))
+     if is_keychain_secret:
+         if not agent_keychain:
+             return {"error": "Keychain support unavailable"}
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index 7c683df..a80f276 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -2163,7 +2163,7 @@ html[data-theme="dark"] .links-add-btn.on { color: #0a0b0d; }
+ .settings-api-key-list { display: flex; flex-direction: column; }
+ .settings-api-key-row {
+   display: grid;
+-  grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1fr) 76px minmax(230px, auto);
++  grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1fr) minmax(150px, 0.65fr) minmax(230px, auto);
+   gap: 12px;
+   align-items: center;
+   padding: 10px 12px;
+@@ -2183,6 +2183,23 @@ html[data-theme="dark"] .links-add-btn.on { color: #0a0b0d; }
+ .settings-api-key-actions { display: flex; justify-content: flex-end; gap: 6px; }
+ .settings-api-key-actions .btn-sm { min-width: 48px; }
+ .settings-api-key-add-row { background: var(--bg-sunken); }
++.settings-type-chip {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  min-height: 24px;
++  padding: 0 8px;
++  border: 1px solid var(--line);
++  border-radius: 999px;
++  color: var(--ink-2);
++  background: var(--bg-sunken);
++  font-size: 11px;
++  white-space: nowrap;
++}
++.settings-type-key {
++  border-color: rgba(16, 163, 127, 0.45);
++  color: var(--ok);
++}
+ .agent-settings-list { display: flex; flex-direction: column; }
+ .agent-settings-row {
+   display: grid;
+diff --git a/ui-static/screens/settings.jsx b/ui-static/screens/settings.jsx
+index cfa4421..dbba6fa 100644
+--- a/ui-static/screens/settings.jsx
++++ b/ui-static/screens/settings.jsx
+@@ -147,6 +147,19 @@ function ApiKeysSection({ onResult }) {
+   const [localError, setLocalError] = useState("");
+   const [newName, setNewName] = useState("");
+   const [newValue, setNewValue] = useState("");
++  const [newType, setNewType] = useState("api_key");
++
++  const typeOptions = [
++    { value: "api_key", label: "API Key (Keychain)", hint: "Stored in macOS Keychain." },
++    { value: "env", label: "Env var (.env)", hint: "Stored in .env after HITL approval." },
++    { value: "path", label: "Path", hint: "Non-secret filesystem path in .env." },
++    { value: "url", label: "URL", hint: "Non-secret URL in .env." },
++    { value: "json_file", label: "JSON file", hint: "Non-secret JSON file path in .env." },
++  ];
++
++  const typeLabel = (type) => (typeOptions.find((opt) => opt.value === type)?.label || "Env var").replace(/ \\(.+\\)$/, "");
++  const rowType = (row) => row.type || (row.source === "keychain" ? "api_key" : "env");
++  const needsMigration = (name, row) => row.source === "env" && /_(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)$/.test(name);
+ 
+   const load = React.useCallback(async () => {
+     try {
+@@ -177,12 +190,40 @@ function ApiKeysSection({ onResult }) {
+     setLocalError("");
+   };
+ 
+-  const save = async (name, value, action = "set") => {
++  const save = async (name, value, action = "set", valueType = "api_key") => {
++    setPending({ ...pending, [name]: true });
++    const r = await fetch("/api/settings/env", {
++      method: "PUT",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ name, value, action, type: valueType }),
++    });
++    const data = await r.json();
++    setPending({ ...pending, [name]: false });
++    if (data.error) {
++      setLocalError(data.error);
++      onResult(data);
++      return;
++    }
++    setEditing({ ...editing, [name]: false });
++    setVisible({ ...visible, [name]: false });
++    setLocalError("");
++    onResult(data);
++    await load();
++  };
++
++  const migrateToKeychain = async (name) => {
+     setPending({ ...pending, [name]: true });
++    const revealResponse = await fetch(`/api/settings/env/${encodeURIComponent(name)}/reveal`);
++    const revealed = await revealResponse.json();
++    if (revealed.error) {
++      setPending({ ...pending, [name]: false });
++      setLocalError(revealed.error);
++      return;
++    }
+     const r = await fetch("/api/settings/env", {
+       method: "PUT",
+       headers: { "Content-Type": "application/json" },
+-      body: JSON.stringify({ name, value, action }),
++      body: JSON.stringify({ name, value: revealed.value || "", action: "set", type: "api_key" }),
+     });
+     const data = await r.json();
+     setPending({ ...pending, [name]: false });
+@@ -191,6 +232,7 @@ function ApiKeysSection({ onResult }) {
+       onResult(data);
+       return;
+     }
++    setDrafts({ ...drafts, [name]: "" });
+     setEditing({ ...editing, [name]: false });
+     setVisible({ ...visible, [name]: false });
+     setLocalError("");
+@@ -201,24 +243,26 @@ function ApiKeysSection({ onResult }) {
+   const add = async () => {
+     const name = newName.trim().toUpperCase();
+     if (!name) return;
+-    await save(name, newValue, "add");
++    await save(name, newValue, "add", newType);
+     setNewName("");
+     setNewValue("");
++    setNewType("api_key");
+   };
+ 
+   const rows = payload.keys || [];
+ 
+   return (
+-    <SettingsPage title="API Keys" sub={`${payload.env_path || "~/agentos/.env"} · writes queue HITL approval`}>
++    <SettingsPage title="API Keys" sub={`${payload.env_path || "~/agentos/.env"} · API keys use Keychain; non-secrets queue HITL approval`}>
+       {localError && <div className="settings-alert settings-alert-error mono">{localError}</div>}
+       <SettingsCard title="Secrets">
+         <div className="settings-api-key-list">
+-          <div className="settings-api-key-row settings-api-key-head mono"><span>key</span><span>value</span><span>state</span><span></span></div>
++          <div className="settings-api-key-row settings-api-key-head mono"><span>key</span><span>value</span><span>type</span><span></span></div>
+           {rows.length === 0 && <div className="muted mono" style={{ padding: 12 }}>no API keys found</div>}
+           {rows.map((row) => {
+             const name = row.name || row.key;
+             const shown = !!visible[name] || !!editing[name];
+             const value = drafts[name] !== undefined ? drafts[name] : "";
++            const type = rowType(row);
+             return (
+               <div className="settings-api-key-row" key={name}>
+                 <span className="mono settings-api-key-name">{name}</span>
+@@ -227,15 +271,20 @@ function ApiKeysSection({ onResult }) {
+                   value={shown ? value : row.masked_value}
+                   readOnly={!editing[name]}
+                   onChange={(e) => setDrafts({ ...drafts, [name]: e.target.value })} />
+-                <span className={"mono " + (row.set ? "txt-ok" : "muted")}>{row.set ? row.source : "unset"}</span>
++                <span className={"settings-type-chip mono " + (type === "api_key" ? "settings-type-key" : "")}>{typeLabel(type)}</span>
+                 <div className="settings-api-key-actions">
++                  {needsMigration(name, row) && (
++                    <button className="btn btn-ghost btn-sm" disabled={pending[name]} onClick={() => migrateToKeychain(name)}>
++                      {pending[name] ? "moving" : "migrate"}
++                    </button>
++                  )}
+                   <button className="btn btn-ghost btn-sm" onClick={() => reveal(name)}>{visible[name] ? "hide" : "show"}</button>
+                   <button className="btn btn-ghost btn-sm" onClick={() => {
+                     if (!visible[name]) reveal(name);
+                     setEditing({ ...editing, [name]: true });
+                   }}>edit</button>
+                   <button className="btn btn-primary btn-sm" disabled={!editing[name] || pending[name]}
+-                    onClick={() => save(name, value)}>{pending[name] ? "queueing" : "save"}</button>
++                    onClick={() => save(name, value, "set", type)}>{pending[name] ? "queueing" : "save"}</button>
+                 </div>
+               </div>
+             );
+@@ -243,7 +292,10 @@ function ApiKeysSection({ onResult }) {
+           <div className="settings-api-key-row settings-api-key-add-row">
+             <input className="inp mono" placeholder="NEW_API_KEY" value={newName} onChange={(e) => setNewName(e.target.value.toUpperCase())} />
+             <input className="inp mono" type="password" placeholder="value" value={newValue} onChange={(e) => setNewValue(e.target.value)} />
+-            <span className="muted mono">new</span>
++            <select className="inp mono" value={newType} title={typeOptions.find((opt) => opt.value === newType)?.hint}
++              onChange={(e) => setNewType(e.target.value)}>
++              {typeOptions.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
++            </select>
+             <div className="settings-api-key-actions">
+               <button className="btn btn-primary btn-sm" disabled={!newName.trim() || pending[newName.trim().toUpperCase()]} onClick={add}>add</button>
+             </div>
