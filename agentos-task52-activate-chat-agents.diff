@@ -1,0 +1,533 @@
+diff --git a/config.toml b/config.toml
+index 9a31ed4..9bd214c 100644
+--- a/config.toml
++++ b/config.toml
+@@ -32,27 +32,34 @@ label = "Gemini"
+ # Override per-launch with: GEMINI_MODEL=gemini-2.5-pro
+ 
+ [agents.kimi]
+-command = "kimi"
++type = "api"
++base_url = "https://api.moonshot.cn/v1"
++model = "moonshot-v1-8k"
+ cwd = ".."
+ color = "#1783ff"
+ label = "Kimi"
++api_key_env = "MOONSHOT_API_KEY"
++temperature = 0.6
+ 
+ [agents.qwen]
+-command = "qwen"
++type = "api"
++base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
++model = "qwen-plus"
+ cwd = ".."
+ color = "#8b5cf6"
+ label = "Qwen"
+-mcp_inject = "settings_file"
+-mcp_settings_path = ".qwen/settings.json"
+-mcp_transport = "http"
+-mcp_merge_project = true  # LosAgentOS C6 Phase A2 -- pick up vault MCP from ~/Documents/.mcp.json
+-inject_delay = 1.0
++api_key_env = "DASHSCOPE_API_KEY"
++temperature = 0.6
+ 
+ [agents.kilo]
+-command = "kilo"
++type = "api"
++base_url = "https://openrouter.ai/api/v1"
++model = "qwen/qwen3-coder"
+ cwd = ".."
+ color = "#f7f677"
+ label = "Kilo"
++api_key_env = "OPENROUTER_API_KEY"
++temperature = 0.4
+ 
+ [agents.minimax]
+ type = "api"
+@@ -63,6 +70,24 @@ label = "MiniMax"
+ api_key_env = "MINIMAX_API_KEY"
+ temperature = 1.0
+ 
++[agents.openrouter]
++type = "api"
++base_url = "https://openrouter.ai/api/v1"
++model = "openai/gpt-oss-120b"
++color = "#ff7a1a"
++label = "OpenRouter"
++api_key_env = "OPENROUTER_API_KEY"
++temperature = 0.7
++
++[agents.hermes]
++type = "api"
++base_url = "https://openrouter.ai/api/v1"
++model = "nousresearch/hermes-3-llama-3.1-405b"
++color = "#d946ef"
++label = "Hermes"
++api_key_env = "OPENROUTER_API_KEY"
++temperature = 0.7
++
+ [routing]
+ # "none" = only route on explicit @mention. "all" = route to all agents by default.
+ default = "none"
+diff --git a/macos-linux/start_kilo.sh b/macos-linux/start_kilo.sh
+index 1a82599..d73c7ef 100755
+--- a/macos-linux/start_kilo.sh
++++ b/macos-linux/start_kilo.sh
+@@ -1,8 +1,5 @@
+ #!/usr/bin/env sh
+-# agentchattr - starts server (if not running) + Kilo wrapper
+-# Usage: sh start_kilo.sh [provider/model]
+-#   e.g. sh start_kilo.sh anthropic/claude-sonnet-4-20250514
+-#   Omit the model to use Kilo's configured default.
++# agentchattr - starts server (if not running) + Kilo API wrapper
+ cd "$(dirname "$0")/.."
+ 
+ PYTHON_BIN=""
+@@ -64,8 +61,4 @@ if ! is_server_running; then
+     done
+ fi
+ 
+-if [ -n "$1" ]; then
+-    .venv/bin/python wrapper.py kilo -- -m "$1"
+-else
+-    .venv/bin/python wrapper.py kilo
+-fi
++.venv/bin/python wrapper_api.py kilo
+diff --git a/macos-linux/start_kimi.sh b/macos-linux/start_kimi.sh
+index 7bda073..05d9225 100755
+--- a/macos-linux/start_kimi.sh
++++ b/macos-linux/start_kimi.sh
+@@ -61,4 +61,4 @@ if ! is_server_running; then
+     done
+ fi
+ 
+-.venv/bin/python wrapper.py kimi
++.venv/bin/python wrapper_api.py kimi
+diff --git a/macos-linux/start_minimax.sh b/macos-linux/start_minimax.sh
+index 5deb262..bf52893 100755
+--- a/macos-linux/start_minimax.sh
++++ b/macos-linux/start_minimax.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env sh
+ # agentchattr — starts server (if not running) + MiniMax API agent wrapper
+ # Usage: sh start_minimax.sh
+-# Requires MINIMAX_API_KEY environment variable.
++# Reads MINIMAX_API_KEY from macOS Keychain when it is not already in the environment.
+ cd "$(dirname "$0")/.."
+ 
+ PYTHON_BIN=""
+@@ -38,14 +38,6 @@ is_server_running() {
+     ss -tlnp 2>/dev/null | grep -q ':8300 '
+ }
+ 
+-# Check API key
+-if [ -z "$MINIMAX_API_KEY" ]; then
+-    echo "Error: MINIMAX_API_KEY environment variable is not set."
+-    echo "Get an API key at https://platform.minimax.io"
+-    echo "Then: export MINIMAX_API_KEY=your-key-here"
+-    exit 1
+-fi
+-
+ ensure_venv
+ 
+ if ! is_server_running; then
+diff --git a/macos-linux/start_qwen.sh b/macos-linux/start_qwen.sh
+index 2a2d192..9ca07ec 100644
+--- a/macos-linux/start_qwen.sh
++++ b/macos-linux/start_qwen.sh
+@@ -61,4 +61,4 @@ if ! is_server_running; then
+     done
+ fi
+ 
+-.venv/bin/python wrapper.py qwen -i "When asked for a reply or to answer, YOU MUST USE the mcp of agentchattr. When talking about a chat, we are speaking about interaction with tools provided by mcp of agentchattr. The human NEVER SEES your usual CLI interface. Just consider this, other instructions will follow."
++.venv/bin/python wrapper_api.py qwen
+diff --git a/macos-linux/start_qwen_yolo.sh b/macos-linux/start_qwen_yolo.sh
+index 3a112d4..bf5085b 100644
+--- a/macos-linux/start_qwen_yolo.sh
++++ b/macos-linux/start_qwen_yolo.sh
+@@ -61,4 +61,4 @@ if ! is_server_running; then
+     done
+ fi
+ 
+-.venv/bin/python wrapper.py qwen  --yolo -i "When asked for a reply or to answer, YOU MUST USE the mcp of agentchattr. When talking about a chat, we are speaking about interaction with tools provided by mcp of agentchattr. The human NEVER SEES your usual CLI interface. Just consider this, other instructions will follow."
++.venv/bin/python wrapper_api.py qwen
+diff --git a/windows/start_kilo.bat b/windows/start_kilo.bat
+index 7b5a37b..a6abaca 100644
+--- a/windows/start_kilo.bat
++++ b/windows/start_kilo.bat
+@@ -1,8 +1,5 @@
+ @echo off
+-REM agentchattr — starts server (if not running) + Kilo wrapper
+-REM Usage: start_kilo.bat [provider/model]
+-REM   e.g. start_kilo.bat anthropic/claude-sonnet-4-20250514
+-REM   Omit the model to use Kilo's configured default.
++REM agentchattr — starts server (if not running) + Kilo API wrapper
+ cd /d "%~dp0.."
+ 
+ REM Auto-create venv and install deps on first run
+@@ -12,17 +9,6 @@ if not exist ".venv" (
+ )
+ call .venv\Scripts\activate.bat
+ 
+-REM Pre-flight: check that kilo CLI is installed
+-where kilo >nul 2>&1
+-if %errorlevel% neq 0 (
+-    echo.
+-    echo   Error: "kilo" was not found on PATH.
+-    echo   Install it first, then try again.
+-    echo.
+-    pause
+-    exit /b 1
+-)
+-
+ REM Start server if not already running, then wait for it
+ netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1
+ if %errorlevel% neq 0 (
+@@ -35,11 +21,7 @@ if %errorlevel% neq 0 (
+     goto :wait_server
+ )
+ 
+-if "%~1"=="" (
+-    python wrapper.py kilo
+-) else (
+-    python wrapper.py kilo -- -m %1
+-)
++python wrapper_api.py kilo
+ if %errorlevel% neq 0 (
+     echo.
+     echo   Agent exited unexpectedly. Check the output above.
+diff --git a/windows/start_kimi.bat b/windows/start_kimi.bat
+index 5c657af..dd9026d 100644
+--- a/windows/start_kimi.bat
++++ b/windows/start_kimi.bat
+@@ -1,5 +1,5 @@
+ @echo off
+-REM agentchattr — starts server (if not running) + Kimi wrapper
++REM agentchattr — starts server (if not running) + Kimi API wrapper
+ cd /d "%~dp0.."
+ 
+ REM Auto-create venv and install deps on first run
+@@ -9,17 +9,6 @@ if not exist ".venv" (
+ )
+ call .venv\Scripts\activate.bat
+ 
+-REM Pre-flight: check that kimi CLI is installed
+-where kimi >nul 2>&1
+-if %errorlevel% neq 0 (
+-    echo.
+-    echo   Error: "kimi" was not found on PATH.
+-    echo   Install it first, then try again.
+-    echo.
+-    pause
+-    exit /b 1
+-)
+-
+ REM Start server if not already running, then wait for it
+ netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1
+ if %errorlevel% neq 0 (
+@@ -32,7 +21,7 @@ if %errorlevel% neq 0 (
+     goto :wait_server
+ )
+ 
+-python wrapper.py kimi
++python wrapper_api.py kimi
+ if %errorlevel% neq 0 (
+     echo.
+     echo   Agent exited unexpectedly. Check the output above.
+diff --git a/windows/start_minimax.bat b/windows/start_minimax.bat
+index a447f2a..79dfd8d 100644
+--- a/windows/start_minimax.bat
++++ b/windows/start_minimax.bat
+@@ -1,7 +1,7 @@
+ @echo off
+ REM agentchattr — starts server (if not running) + MiniMax API agent wrapper
+ REM Usage: start_minimax.bat
+-REM Requires MINIMAX_API_KEY environment variable.
++REM Reads MINIMAX_API_KEY from macOS Keychain when it is not already in the environment.
+ cd /d "%~dp0.."
+ 
+ REM Auto-create venv and install deps on first run
+@@ -11,17 +11,6 @@ if not exist ".venv" (
+ )
+ call .venv\Scripts\activate.bat
+ 
+-REM Check API key
+-if "%MINIMAX_API_KEY%"=="" (
+-    echo.
+-    echo   Error: MINIMAX_API_KEY environment variable is not set.
+-    echo   Get an API key at https://platform.minimax.io
+-    echo   Then: set MINIMAX_API_KEY=your-key-here
+-    echo.
+-    pause
+-    exit /b 1
+-)
+-
+ REM Start server if not already running, then wait for it
+ netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1
+ if %errorlevel% neq 0 (
+diff --git a/windows/start_qwen.bat b/windows/start_qwen.bat
+index 92ccf77..1d53b7d 100644
+--- a/windows/start_qwen.bat
++++ b/windows/start_qwen.bat
+@@ -1,5 +1,5 @@
+ @echo off
+-REM agentchattr — starts server (if not running) + Qwen wrapper
++REM agentchattr — starts server (if not running) + Qwen API wrapper
+ cd /d "%~dp0.."
+ 
+ REM Auto-create venv and install deps on first run
+@@ -9,17 +9,6 @@ if not exist ".venv" (
+ )
+ call .venv\Scripts\activate.bat
+ 
+-REM Pre-flight: check that qwen CLI is installed
+-where qwen >nul 2>&1
+-if %errorlevel% neq 0 (
+-    echo.
+-    echo   Error: "qwen" was not found on PATH.
+-    echo   Install it first: npm install -g @qwen-code/qwen-code
+-    echo.
+-    pause
+-    exit /b 1
+-)
+-
+ REM Start server if not already running, then wait for it
+ netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1
+ if %errorlevel% neq 0 (
+@@ -32,7 +21,7 @@ if %errorlevel% neq 0 (
+     goto :wait_server
+ )
+ 
+-python wrapper.py qwen -i "When asked for a reply or to answer, YOU MUST USE the mcp of agentchattr. When talking about a chat, we are speaking about interaction with tools provided by mcp of agentchattr. The human NEVER SEES your usual CLI interface. Just consider this, other instructions will follow."
++python wrapper_api.py qwen
+ if %errorlevel% neq 0 (
+     echo.
+     echo   Agent exited unexpectedly. Check the output above.
+diff --git a/windows/start_qwen_yolo.bat b/windows/start_qwen_yolo.bat
+index fcf45e3..1141196 100644
+--- a/windows/start_qwen_yolo.bat
++++ b/windows/start_qwen_yolo.bat
+@@ -32,7 +32,7 @@ if %errorlevel% neq 0 (
+     goto :wait_server
+ )
+ 
+-python wrapper.py qwen --yolo -i "When asked for a reply or to answer, YOU MUST USE the mcp of agentchattr. When talking about a chat, we are speaking about interaction with tools provided by mcp of agentchattr. The human NEVER SEES your usual CLI interface. Just consider this, other instructions will follow."
++python wrapper_api.py qwen
+ if %errorlevel% neq 0 (
+     echo.
+     echo   Agent exited unexpectedly. Check the output above.
+diff --git a/macos-linux/start_openrouter.sh b/macos-linux/start_openrouter.sh
+new file mode 100755
+index 0000000..d6802d0
+--- /dev/null
++++ b/macos-linux/start_openrouter.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env sh
++# agentchattr — starts server (if not running) + OpenRouter API agent wrapper
++cd "$(dirname "$0")/.."
++exec sh macos-linux/start_api_agent.sh openrouter
+diff --git a/macos-linux/start_hermes.sh b/macos-linux/start_hermes.sh
+new file mode 100755
+index 0000000..15b6d15
+--- /dev/null
++++ b/macos-linux/start_hermes.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env sh
++# agentchattr — starts server (if not running) + Hermes API agent wrapper
++cd "$(dirname "$0")/.."
++exec sh macos-linux/start_api_agent.sh hermes
+diff --git a/windows/start_openrouter.bat b/windows/start_openrouter.bat
+new file mode 100644
+index 0000000..5a1a82b
+--- /dev/null
++++ b/windows/start_openrouter.bat
+@@ -0,0 +1,4 @@
++@echo off
++REM agentchattr — starts server (if not running) + OpenRouter API agent wrapper
++cd /d "%~dp0.."
++call windows\start_api_agent.bat openrouter
+diff --git a/windows/start_hermes.bat b/windows/start_hermes.bat
+new file mode 100644
+index 0000000..5f27679
+--- /dev/null
++++ b/windows/start_hermes.bat
+@@ -0,0 +1,4 @@
++@echo off
++REM agentchattr — starts server (if not running) + Hermes API agent wrapper
++cd /d "%~dp0.."
++call windows\start_api_agent.bat hermes
+diff --git a/macos-linux/launch-agents/com.user.agentchattr-kimi.plist b/macos-linux/launch-agents/com.user.agentchattr-kimi.plist
+new file mode 100644
+index 0000000..5d4749d
+--- /dev/null
++++ b/macos-linux/launch-agents/com.user.agentchattr-kimi.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-kimi</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/Documents/agentchattr/macos-linux/start_kimi.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/Documents/agentchattr</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/kimi.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/kimi.launchd.err</string>
++</dict>
++</plist>
+diff --git a/macos-linux/launch-agents/com.user.agentchattr-qwen.plist b/macos-linux/launch-agents/com.user.agentchattr-qwen.plist
+new file mode 100644
+index 0000000..f3c5f8c
+--- /dev/null
++++ b/macos-linux/launch-agents/com.user.agentchattr-qwen.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-qwen</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/Documents/agentchattr/macos-linux/start_qwen.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/Documents/agentchattr</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/qwen.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/qwen.launchd.err</string>
++</dict>
++</plist>
+diff --git a/macos-linux/launch-agents/com.user.agentchattr-kilo.plist b/macos-linux/launch-agents/com.user.agentchattr-kilo.plist
+new file mode 100644
+index 0000000..93209f2
+--- /dev/null
++++ b/macos-linux/launch-agents/com.user.agentchattr-kilo.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-kilo</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/Documents/agentchattr/macos-linux/start_kilo.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/Documents/agentchattr</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/kilo.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/kilo.launchd.err</string>
++</dict>
++</plist>
+diff --git a/macos-linux/launch-agents/com.user.agentchattr-minimax.plist b/macos-linux/launch-agents/com.user.agentchattr-minimax.plist
+new file mode 100644
+index 0000000..77d3cb0
+--- /dev/null
++++ b/macos-linux/launch-agents/com.user.agentchattr-minimax.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-minimax</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/Documents/agentchattr/macos-linux/start_minimax.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/Documents/agentchattr</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/minimax.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/minimax.launchd.err</string>
++</dict>
++</plist>
+diff --git a/macos-linux/launch-agents/com.user.agentchattr-openrouter.plist b/macos-linux/launch-agents/com.user.agentchattr-openrouter.plist
+new file mode 100644
+index 0000000..2618812
+--- /dev/null
++++ b/macos-linux/launch-agents/com.user.agentchattr-openrouter.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-openrouter</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/Documents/agentchattr/macos-linux/start_openrouter.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/Documents/agentchattr</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/openrouter.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/openrouter.launchd.err</string>
++</dict>
++</plist>
+diff --git a/macos-linux/launch-agents/com.user.agentchattr-hermes.plist b/macos-linux/launch-agents/com.user.agentchattr-hermes.plist
+new file mode 100644
+index 0000000..fd52ecb
+--- /dev/null
++++ b/macos-linux/launch-agents/com.user.agentchattr-hermes.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-hermes</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/Documents/agentchattr/macos-linux/start_hermes.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/Documents/agentchattr</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/hermes.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/hermes.launchd.err</string>
++</dict>
++</plist>

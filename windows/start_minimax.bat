@@ -1,7 +1,7 @@
 @echo off
 REM agentchattr — starts server (if not running) + MiniMax API agent wrapper
 REM Usage: start_minimax.bat
-REM Requires MINIMAX_API_KEY environment variable.
+REM Reads MINIMAX_API_KEY from macOS Keychain when it is not already in the environment.
 cd /d "%~dp0.."
 
 REM Auto-create venv and install deps on first run
@@ -10,17 +10,6 @@ if not exist ".venv" (
     .venv\Scripts\pip install -q -r requirements.txt >nul 2>nul
 )
 call .venv\Scripts\activate.bat
-
-REM Check API key
-if "%MINIMAX_API_KEY%"=="" (
-    echo.
-    echo   Error: MINIMAX_API_KEY environment variable is not set.
-    echo   Get an API key at https://platform.minimax.io
-    echo   Then: set MINIMAX_API_KEY=your-key-here
-    echo.
-    pause
-    exit /b 1
-)
 
 REM Start server if not already running, then wait for it
 netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1

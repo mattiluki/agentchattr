@@ -1,0 +1,4 @@
+@echo off
+REM agentchattr — starts server (if not running) + Hermes API agent wrapper
+cd /d "%~dp0.."
+call windows\start_api_agent.bat hermes

@@ -32,27 +32,34 @@ label = "Gemini"
 # Override per-launch with: GEMINI_MODEL=gemini-2.5-pro
 
 [agents.kimi]
-command = "kimi"
+type = "api"
+base_url = "https://api.moonshot.cn/v1"
+model = "moonshot-v1-8k"
 cwd = ".."
 color = "#1783ff"
 label = "Kimi"
+api_key_env = "MOONSHOT_API_KEY"
+temperature = 0.6
 
 [agents.qwen]
-command = "qwen"
+type = "api"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+model = "qwen-plus"
 cwd = ".."
 color = "#8b5cf6"
 label = "Qwen"
-mcp_inject = "settings_file"
-mcp_settings_path = ".qwen/settings.json"
-mcp_transport = "http"
-mcp_merge_project = true  # LosAgentOS C6 Phase A2 -- pick up vault MCP from ~/Documents/.mcp.json
-inject_delay = 1.0
+api_key_env = "DASHSCOPE_API_KEY"
+temperature = 0.6
 
 [agents.kilo]
-command = "kilo"
+type = "api"
+base_url = "https://openrouter.ai/api/v1"
+model = "qwen/qwen3-coder"
 cwd = ".."
 color = "#f7f677"
 label = "Kilo"
+api_key_env = "OPENROUTER_API_KEY"
+temperature = 0.4
 
 [agents.minimax]
 type = "api"
@@ -62,6 +69,24 @@ color = "#2fe898"
 label = "MiniMax"
 api_key_env = "MINIMAX_API_KEY"
 temperature = 1.0
+
+[agents.openrouter]
+type = "api"
+base_url = "https://openrouter.ai/api/v1"
+model = "openai/gpt-oss-120b"
+color = "#ff7a1a"
+label = "OpenRouter"
+api_key_env = "OPENROUTER_API_KEY"
+temperature = 0.7
+
+[agents.hermes]
+type = "api"
+base_url = "https://openrouter.ai/api/v1"
+model = "nousresearch/hermes-3-llama-3.1-405b"
+color = "#d946ef"
+label = "Hermes"
+api_key_env = "OPENROUTER_API_KEY"
+temperature = 0.7
 
 [routing]
 # "none" = only route on explicit @mention. "all" = route to all agents by default.

@@ -1,8 +1,5 @@
 #!/usr/bin/env sh
-# agentchattr - starts server (if not running) + Kilo wrapper
-# Usage: sh start_kilo.sh [provider/model]
-#   e.g. sh start_kilo.sh anthropic/claude-sonnet-4-20250514
-#   Omit the model to use Kilo's configured default.
+# agentchattr - starts server (if not running) + Kilo API wrapper
 cd "$(dirname "$0")/.."
 
 PYTHON_BIN=""
@@ -64,8 +61,4 @@ if ! is_server_running; then
     done
 fi
 
-if [ -n "$1" ]; then
-    .venv/bin/python wrapper.py kilo -- -m "$1"
-else
-    .venv/bin/python wrapper.py kilo
-fi
+.venv/bin/python wrapper_api.py kilo

@@ -61,4 +61,4 @@ if ! is_server_running; then
     done
 fi
 
-.venv/bin/python wrapper.py kimi
+.venv/bin/python wrapper_api.py kimi
