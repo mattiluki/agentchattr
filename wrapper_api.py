@@ -26,9 +26,28 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).parent
+
+
+def _keychain_value(name: str) -> str:
+    if not name:
+        return ""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", f"agentos.{name}", "-w"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.rstrip("\n")
+    except Exception:
+        pass
+    return ""
 
 
 def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
@@ -74,6 +93,8 @@ def main():
     model = agent_cfg.get("model", "")
     api_key_env = agent_cfg.get("api_key_env", "")
     api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+    if api_key_env and not api_key:
+        api_key = _keychain_value(api_key_env)
     temperature = agent_cfg.get("temperature")
     if temperature is not None:
         temperature = float(temperature)
@@ -266,6 +287,9 @@ def main():
         my_name = get_name()
         set_working(True)
         try:
+            if api_key_env and not api_key:
+                send_message(f"needs_key: {api_key_env} is not set in macOS Keychain.", channel=channel)
+                return
             chat_msgs = read_messages(channel=channel, limit=context_messages)
             if not chat_msgs:
                 return

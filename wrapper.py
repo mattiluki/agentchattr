@@ -21,6 +21,7 @@ How it works:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +30,42 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 
 SERVER_NAME = "agentchattr"
+
+KEYCHAIN_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_CLOUD_API_KEY",
+    "OPENROUTER_API_KEY",
+    "MOONSHOT_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "MINIMAX_API_KEY",
+    "FAL_KEY",
+    "KLING_API_KEY",
+)
+
+
+def _load_keychain_env(env: dict[str, str]) -> dict[str, str]:
+    if shutil.which("security") is None:
+        return env
+    next_env = dict(env)
+    for key in KEYCHAIN_ENV_KEYS:
+        if next_env.get(key):
+            continue
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", f"agentos.{key}", "-w"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout:
+            next_env[key] = result.stdout.rstrip("\n")
+    return next_env
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +718,7 @@ def main():
 
     strip_vars = {"CLAUDECODE"} | set(agent_cfg.get("strip_env", []))
     env = {k: v for k, v in os.environ.items() if k not in strip_vars}
+    env = _load_keychain_env(env)
 
     resolved = shutil.which(command)
     if not resolved:
