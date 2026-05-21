@@ -29,10 +29,12 @@ class Instance:
     epoch: int = 1
     state: str = "pending"   # "pending" | "active"
     registered_at: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
 
 
 class RuntimeRegistry:
     GRACE_PERIOD = 30  # seconds — name reserved after deregister
+    STALE_ALIAS_TTL = 30 * 60  # seconds — clear dead numbered aliases after 30 min
 
     def __init__(self, data_dir: str = "./data"):
         self._lock = threading.Lock()
@@ -101,6 +103,7 @@ class RuntimeRegistry:
                 return None
 
             self._expire_reserved()
+            self._gc_stale_aliases(base)
 
             # Find next free slot
             taken = {i.slot for i in self._instances.values() if i.base == base}
@@ -516,6 +519,15 @@ class RuntimeRegistry:
             return [_inst_dict(i) for i in self._instances.values()
                     if i.state == "pending"]
 
+    def touch(self, name: str, now: float | None = None) -> bool:
+        """Update heartbeat freshness for an instance."""
+        with self._lock:
+            inst = self._instances.get(name)
+            if not inst:
+                return False
+            inst.last_seen = now if now is not None else time.time()
+            return True
+
     # --- Internal ---
 
     def _conflicts_with_other_family(self, name: str, own_base: str) -> str | None:
@@ -561,6 +573,31 @@ class RuntimeRegistry:
         self._reserved = {n: t for n, t in self._reserved.items()
                           if now - t < self.GRACE_PERIOD}
 
+    def _gc_stale_aliases(self, base: str):
+        """Drop stale numbered aliases so a fresh canonical registration can reuse base.
+
+        This protects normal concurrent instances: a recently heartbeating
+        numbered alias is retained and the next registration still gets -N.
+        """
+        now = time.time()
+        if base in self._instances:
+            return
+        stale = [
+            name for name, inst in self._instances.items()
+            if inst.base == base
+            and inst.name != base
+            and now - inst.last_seen > self.STALE_ALIAS_TTL
+        ]
+        for name in stale:
+            del self._instances[name]
+            self._reserved.pop(name, None)
+            self._renames.pop(name, None)
+        if stale:
+            stale_values = set(stale)
+            for old, new in list(self._renames.items()):
+                if new in stale_values:
+                    del self._renames[old]
+
 
 # --- Module-level helpers ---
 
@@ -571,6 +608,7 @@ def _inst_dict(inst: Instance, include_token: bool = False) -> dict:
         "label": inst.label, "color": inst.color, "state": inst.state,
         "epoch": inst.epoch,
         "registered_at": inst.registered_at,
+        "last_seen": inst.last_seen,
     }
     if include_token:
         d["token"] = inst.token

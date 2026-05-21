@@ -2100,7 +2100,9 @@ async def register_agent(request: Request):
     # Touch presence so the instance doesn't immediately time out
     import mcp_bridge
     with mcp_bridge._presence_lock:
-        mcp_bridge._presence[result["name"]] = __import__("time").time()
+        now = __import__("time").time()
+        mcp_bridge._presence[result["name"]] = now
+    registry.touch(result["name"], now)
     # If slot 1 was renamed (e.g. "claude" → "claude-1"), migrate state
     renamed = result.pop("_renamed_slot1", None)
     if renamed:
@@ -2213,7 +2215,9 @@ async def heartbeat(agent_name: str, request: Request):
 
     current_name = auth_inst["name"] if auth_inst else agent_name
     with mcp_bridge._presence_lock:
-        mcp_bridge._presence[current_name] = __import__("time").time()
+        now = __import__("time").time()
+        mcp_bridge._presence[current_name] = now
+    registry.touch(current_name, now)
     # Optional activity report from wrapper's terminal monitor
     _activity_changed = False
     try:
@@ -2248,9 +2252,9 @@ async def heartbeat(agent_name: str, request: Request):
             resp["pending"] = inst.get("state") == "pending"
             # Also update presence under the canonical name
             if canonical != current_name:
-                now = __import__("time").time()
                 with mcp_bridge._presence_lock:
                     mcp_bridge._presence[canonical] = now
+                registry.touch(canonical, now)
     return resp
 
 
