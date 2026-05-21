@@ -1,0 +1,444 @@
+diff --git a/serve.py b/serve.py
+index 3e459dc..41bc295 100644
+--- a/serve.py
++++ b/serve.py
+@@ -22,6 +22,7 @@ from pathlib import Path
+ 
+ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import JSONResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+@@ -1924,7 +1925,7 @@ def _read_phase_events(limit: int = 20, project_slug: str | None = None) -> list
+             continue
+         if project_slug and ev.get("project") != project_slug:
+             continue
+-        rows.append({
++        row = {
+             "kind": ev.get("kind"),
+             "ts": ev.get("ts"),
+             "project": ev.get("project"),
+@@ -1933,11 +1934,33 @@ def _read_phase_events(limit: int = 20, project_slug: str | None = None) -> list
+             "agent": ev.get("agent"),
+             "summary": ev.get("summary"),
+             "next": ev.get("next"),
+-        })
++        }
++        for key in ("commits", "original_ts", "revert_commits"):
++            if key in ev:
++                row[key] = ev.get(key)
++        rows.append(row)
+     rows.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+     return rows[:limit]
+ 
+ 
++def _find_phase_event(slug: str, ts: str) -> tuple[dict | None, list[dict]]:
++    events = _read_phase_events(500, slug)
++    for ev in events:
++        if ev.get("ts") == ts:
++            return ev, events
++    return None, events
++
++
++def _normalize_commit_results(results: list[dict]) -> list[dict]:
++    commits = []
++    for item in results or []:
++        sha = item.get("sha") or item.get("commit")
++        repo = item.get("repo")
++        if repo and sha and not item.get("error") and not item.get("skipped"):
++            commits.append({"repo": repo, "sha": sha})
++    return commits
++
++
+ def _workflow_rows() -> list[dict]:
+     import time as _t
+     if not PROJECTS_DIR.exists():
+@@ -2148,20 +2171,30 @@ async def project_phase_approve(slug: str):
+                         push_result = "pushed"
+                     except _sp.CalledProcessError as e:
+                         push_result = f"push failed: {e.stderr.decode()[:100] if e.stderr else 'error'}"
+-            results.append({"repo": repo, "commit": commit_sha, "push": push_result})
++            results.append({"repo": repo, "commit": commit_sha, "sha": commit_sha, "push": push_result})
+         except _sp.CalledProcessError as e:
+             results.append({"repo": repo, "error": e.stderr.decode()[:200] if e.stderr else "git failed"})
+         except Exception as e:
+             results.append({"repo": repo, "error": str(e)[:200]})
+ 
+     current_phase = _phase_by_name(wf, phase)
++    commit_refs = _normalize_commit_results(results)
++    approved_event = _record_phase_event(
++        "phase-approved",
++        slug,
++        wf,
++        task_id,
++        phase,
++        f"approved phase {phase!r} for task #{task_id}",
++        {"commits": commit_refs},
++    )
+     if current_phase.get("pause_after") is True:
+         wf["phase_state"] = "paused_for_review"
+         msg = f"phase {phase!r} paused for HITL review"
+         event = _record_phase_event("phase-paused", slug, wf, task_id, phase, msg)
+     else:
+         msg = _advance_workflow_phase(pr, fm, wf, task_id)
+-        event = None
++        event = approved_event
+ 
+     if wf.get("phase_state") != "paused_for_review":
+         wf.pop("pending_review_path", None)
+@@ -2187,6 +2220,112 @@ async def project_phase_approve(slug: str):
+     }
+ 
+ 
++@app.get("/api/projects/{slug}/phase-events")
++async def project_phase_events(slug: str, limit: int = 50):
++    return _read_phase_events(limit, slug)
++
++
++@app.post("/api/projects/{slug}/phase-events/{event_ts}/revert")
++async def project_phase_event_revert(slug: str, event_ts: str):
++    import subprocess as _sp
++
++    pr = _read_vault_page(PROJECTS_DIR, slug, PROJECT_EXTRA_FIELDS)
++    if not pr:
++        return JSONResponse(status_code=404, content={"error": "project not found"})
++
++    event, events = _find_phase_event(slug, event_ts)
++    if not event:
++        return JSONResponse(status_code=400, content={"error": "phase event not found"})
++    if event.get("kind") not in ("phase-approved", "phase-committed"):
++        return JSONResponse(status_code=400, content={"error": "event is not revertable"})
++
++    commits = event.get("commits") or []
++    if not commits:
++        return JSONResponse(status_code=400, content={"error": "event has no commits to revert"})
++
++    if any(ev.get("kind") == "phase-reverted" and ev.get("original_ts") == event_ts for ev in events):
++        return JSONResponse(status_code=409, content={"error": "phase event already reverted"})
++
++    wf = (pr.get("_frontmatter") or {}).get("workflow") or {}
++    if wf.get("auto_commit") is False:
++        return JSONResponse(status_code=400, content={"error": "workflow auto_commit is disabled"})
++    do_push = wf.get("auto_push", True)
++    reverts = []
++    for item in commits:
++        repo = item.get("repo")
++        original_sha = item.get("sha") or item.get("commit")
++        if not repo or not original_sha:
++            continue
++        repo_path = Path(repo)
++        if not (repo_path / ".git").exists():
++            return JSONResponse(status_code=400, content={"error": f"not a git repo: {repo}"})
++        try:
++            _sp.run(
++                ["/usr/bin/git", "-C", repo, "revert", "--no-edit", original_sha],
++                check=True,
++                capture_output=True,
++                timeout=30,
++            )
++            revert_sha = _sp.run(
++                ["/usr/bin/git", "-C", repo, "rev-parse", "HEAD"],
++                check=True,
++                capture_output=True,
++                text=True,
++                timeout=5,
++            ).stdout.strip()[:8]
++            push_result = "skipped (no remote or auto_push=false)"
++            current_revert = {
++                "repo": repo,
++                "original_sha": original_sha,
++                "revert_sha": revert_sha,
++                "push": push_result,
++            }
++            if do_push:
++                remote = _sp.run(
++                    ["/usr/bin/git", "-C", repo, "remote"],
++                    capture_output=True,
++                    text=True,
++                    timeout=3,
++                ).stdout.strip()
++                if remote:
++                    try:
++                        _sp.run(["/usr/bin/git", "-C", repo, "push"], check=True, capture_output=True, timeout=60)
++                        current_revert["push"] = "pushed"
++                    except _sp.CalledProcessError as e:
++                        stderr = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
++                        reverts.append(current_revert)
++                        return JSONResponse(
++                            status_code=409,
++                            content={"error": f"git push failed for {repo}: {stderr[:200] or 'git failed'}", "reverts": reverts},
++                        )
++            reverts.append(current_revert)
++        except _sp.CalledProcessError as e:
++            stderr = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
++            return JSONResponse(
++                status_code=409,
++                content={"error": f"git revert failed for {repo}: {stderr[:200] or 'git failed'}", "reverts": reverts},
++            )
++        except Exception as e:
++            return JSONResponse(
++                status_code=409,
++                content={"error": f"revert failed for {repo}: {str(e)[:200]}", "reverts": reverts},
++            )
++
++    new_event = _record_phase_event(
++        "phase-reverted",
++        slug,
++        wf,
++        event.get("task_id"),
++        event.get("phase"),
++        f"reverted commits from ts={event_ts}",
++        {
++            "original_ts": event_ts,
++            "revert_commits": [{"repo": r["repo"], "sha": r["revert_sha"]} for r in reverts],
++        },
++    )
++    return {"ok": True, "reverts": reverts, "event": new_event}
++
++
+ @app.post("/api/projects/{slug}/phases/request-changes")
+ async def project_phase_request_changes(slug: str, payload: dict):
+     """User rejects phase, sends notes back. Phase stays open for the same agent."""
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index d46e1c7..40f8716 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -3044,6 +3044,28 @@ html[data-theme="dark"] .filter-count { color: #0a0b0d; }
+ }
+ .lib-tool-foot b { color: var(--ink); font-weight: 500; }
+ 
++.phase-event-row .phase-revert-btn {
++  opacity: 0;
++  width: 26px;
++  height: 24px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  border: 1px solid var(--line);
++  border-radius: 5px;
++  background: var(--bg);
++  color: var(--ink-2);
++  cursor: pointer;
++}
++.phase-event-row:hover .phase-revert-btn,
++.phase-event-row .phase-revert-btn:focus {
++  opacity: 1;
++}
++.phase-event-row .phase-revert-btn:hover {
++  border-color: #c03f3f66;
++  color: #c03f3f;
++}
++
+ /* Tag color variants */
+ .tag-color-ok      { border-color: rgba(31,138,91,0.3); }
+ .tag-color-warn    { border-color: rgba(194,130,0,0.3); }
+diff --git a/ui-static/screens/define.jsx b/ui-static/screens/define.jsx
+index 690fc16..4397fd7 100644
+--- a/ui-static/screens/define.jsx
++++ b/ui-static/screens/define.jsx
+@@ -1265,6 +1265,7 @@ function ProjectEditor({ slug, onDelete, onSaved }) {
+       </div>
+ 
+       <ProjectPhaseApproval slug={slug} />
++      <ProjectPhaseEvents slug={slug} />
+ 
+       {tab === "define" && <ProjectDefineTab doc={doc} catalog={catalog} update={update} />}
+       {tab === "tasks"  && <ProjectTasks slug={slug} agents={catalog.agents} onCount={(n) => setCounts(c => ({...c, tasks: n}))} />}
+@@ -1273,6 +1274,96 @@ function ProjectEditor({ slug, onDelete, onSaved }) {
+   );
+ }
+ 
++function canRevertProjectPhaseEvent(ev, events) {
++  const commits = ev.commits || [];
++  if (!["phase-approved", "phase-committed"].includes(ev.kind)) return false;
++  if (commits.length === 0) return false;
++  return !(events || []).some((candidate) => (
++    candidate.kind === "phase-reverted" && candidate.original_ts === ev.ts
++  ));
++}
++
++function ProjectPhaseEvents({ slug }) {
++  const [events, setEvents] = React.useState([]);
++  const [msg, setMsg] = React.useState("");
++
++  const load = React.useCallback(() => {
++    fetch(`/api/projects/${encodeURIComponent(slug)}/phase-events?limit=12`)
++      .then(r => r.json())
++      .then(d => setEvents(Array.isArray(d) ? d : []))
++      .catch(() => {});
++  }, [slug]);
++
++  React.useEffect(() => {
++    load();
++    const t = setInterval(load, 10000);
++    return () => clearInterval(t);
++  }, [load]);
++
++  if (!events.length) return null;
++
++  const revert = async (ev) => {
++    const commits = ev.commits || [];
++    if (!ev.ts || commits.length === 0) return;
++    if (!confirm(`Revert phase '${ev.phase || "?"}' for task #${ev.task_id || "?"}? Reverts commits in ${commits.length} repos.`)) return;
++    setMsg("reverting...");
++    try {
++      const r = await fetch(`/api/projects/${encodeURIComponent(slug)}/phase-events/${encodeURIComponent(ev.ts)}/revert`, { method: "POST" });
++      const d = await r.json();
++      if (d.error) setMsg(`error: ${d.error}`);
++      else {
++        const summary = (d.reverts || []).map(x => `${x.repo.split("/").pop()}:${x.revert_sha}`).join(", ");
++        setMsg(`reverted: ${summary || "done"}`);
++        setTimeout(load, 800);
++      }
++    } catch (e) {
++      setMsg(`error: ${String(e).slice(0,120)}`);
++    }
++  };
++
++  return (
++    <div style={{
++      marginTop: 12, padding: "10px 12px",
++      background: "var(--bg-sunken)", borderRadius: 8,
++      border: "1px solid var(--line)",
++    }}>
++      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
++        <div className="mono muted" style={{fontSize:10,letterSpacing:0.06,textTransform:"uppercase",flex:1}}>
++          phase events
++        </div>
++        <button className="btn btn-ghost mono" style={{padding:"3px 8px",fontSize:10}} onClick={load}>refresh</button>
++      </div>
++      {events.map((ev, i) => {
++        const revertable = canRevertProjectPhaseEvent(ev, events);
++        const reverted = events.some(candidate => candidate.kind === "phase-reverted" && candidate.original_ts === ev.ts);
++        return (
++          <div key={`${ev.kind}-${ev.ts}-${i}`} className="phase-event-row" style={{
++            padding:"7px 0",borderTop:i ? "1px solid var(--line)" : 0,
++            opacity: reverted ? 0.6 : 1,
++            textDecoration: reverted ? "line-through" : "none",
++          }}>
++            <div style={{display:"flex",alignItems:"center",gap:6}}>
++              <span className="mono" style={{fontSize:10,color:"var(--accent)",flex:1}}>
++                {ev.kind || "event"} · {ev.phase || "phase?"}
++              </span>
++              {revertable && (
++                <button className="phase-revert-btn mono" title="Revert phase commits" onClick={() => revert(ev)}>
++                  ⌫
++                </button>
++              )}
++            </div>
++            <div style={{fontSize:12,color:"var(--ink-2)",marginTop:2}}>{ev.summary || ev.next || "No summary"}</div>
++            <div className="mono muted" style={{fontSize:10,marginTop:2}}>
++              task {ev.task_id ? `#${ev.task_id}` : "?"} · {ev.ts || ""} {ev.agent ? `· @${ev.agent}` : ""}
++            </div>
++          </div>
++        );
++      })}
++      {msg && <div className="define-msg mono" style={{marginTop:8}}>{msg}</div>}
++    </div>
++  );
++}
++
+ // ─── Project Define sub-tab: goal · deadline · description · composition ──
+ function ProjectDefineTab({ doc, catalog, update }) {
+   return (
+diff --git a/ui-static/screens/workflows.jsx b/ui-static/screens/workflows.jsx
+index 521052f..9561dca 100644
+--- a/ui-static/screens/workflows.jsx
++++ b/ui-static/screens/workflows.jsx
+@@ -57,6 +57,25 @@ function WorkflowsScreen({ onSelectAgent, onNavigate }) {
+     }
+   };
+ 
++  const revertPhaseEvent = async (row, ev) => {
++    const commits = ev.commits || [];
++    if (!ev.ts || commits.length === 0) return;
++    if (!confirm(`Revert phase '${ev.phase || "?"}' for task #${ev.task_id || "?"}? Reverts commits in ${commits.length} repos.`)) return;
++    setMsg("reverting...");
++    try {
++      const r = await fetch(
++        `/api/projects/${encodeURIComponent(row.project_slug)}/phase-events/${encodeURIComponent(ev.ts)}/revert`,
++        { method: "POST" }
++      );
++      const d = await r.json();
++      if (d.error) setMsg(`error: ${d.error}`);
++      else setMsg(`reverted: ${(d.reverts || []).map((x) => `${x.repo.split("/").pop()}:${x.revert_sha}`).join(", ")}`);
++      setTimeout(load, 800);
++    } catch (e) {
++      setMsg(`error: ${String(e).slice(0, 120)}`);
++    }
++  };
++
+   return (
+     <div className="screen workflows-screen">
+       <div className="wf-header">
+@@ -114,6 +133,7 @@ function WorkflowsScreen({ onSelectAgent, onNavigate }) {
+           <WorkflowSidePanel
+             row={focused}
+             onAction={runWorkflowAction}
++            onRevert={revertPhaseEvent}
+           />
+         </div>
+       )}
+@@ -205,7 +225,16 @@ function WorkflowProjectCard({ row, focused, onFocus, onAction, onSelectAgent })
+   );
+ }
+ 
+-function WorkflowSidePanel({ row, onAction }) {
++function canRevertPhaseEvent(ev, events) {
++  const commits = ev.commits || [];
++  if (!["phase-approved", "phase-committed"].includes(ev.kind)) return false;
++  if (commits.length === 0) return false;
++  return !(events || []).some((candidate) => (
++    candidate.kind === "phase-reverted" && candidate.original_ts === ev.ts
++  ));
++}
++
++function WorkflowSidePanel({ row, onAction, onRevert }) {
+   if (!row) return null;
+   const wf = row.workflow || {};
+   const state = wf.phase_state || "idle";
+@@ -244,20 +273,37 @@ function WorkflowSidePanel({ row, onAction }) {
+         {events.length === 0 && (
+           <div className="usedby-empty mono" style={{display: "block", marginTop: 8}}>no phase events yet</div>
+         )}
+-        {events.map((ev, i) => (
+-          <div key={`${ev.kind}-${ev.ts}-${i}`} style={{
++        {events.map((ev, i) => {
++          const revertable = canRevertPhaseEvent(ev, events);
++          const reverted = events.some((candidate) => (
++            candidate.kind === "phase-reverted" && candidate.original_ts === ev.ts
++          ));
++          return (
++          <div key={`${ev.kind}-${ev.ts}-${i}`} className="phase-event-row" style={{
+             padding: "7px 0", borderBottom: "1px solid var(--line)",
+-            fontSize: 12,
++            fontSize: 12, opacity: reverted ? 0.6 : 1,
++            textDecoration: reverted ? "line-through" : "none",
+           }}>
+-            <div className="mono" style={{fontSize: 10, color: "var(--accent)"}}>
+-              {ev.kind || "event"} · {ev.phase || "phase?"}
++            <div style={{display: "flex", alignItems: "center", gap: 6}}>
++              <div className="mono" style={{fontSize: 10, color: "var(--accent)", flex: 1}}>
++                {ev.kind || "event"} · {ev.phase || "phase?"}
++              </div>
++              {revertable && (
++                <button
++                  className="phase-revert-btn mono"
++                  title="Revert phase commits"
++                  onClick={() => onRevert(row, ev)}
++                >
++                  ⌫
++                </button>
++              )}
+             </div>
+             <div style={{color: "var(--ink-2)", marginTop: 2}}>{ev.summary || ev.next || "No summary"}</div>
+             <div className="mono muted" style={{fontSize: 10, marginTop: 2}}>
+               {ev.ts || ""} {ev.agent ? `· @${ev.agent}` : ""}
+             </div>
+           </div>
+-        ))}
++        )})}
+       </div>
+     </div>
+   );
