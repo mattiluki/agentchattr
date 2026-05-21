@@ -1,0 +1,49 @@
+--- /private/tmp/agentos-serve-before51.py	2026-05-21 15:56:13
++++ serve.py	2026-05-21 15:56:46
+@@ -1999,6 +1999,14 @@
+     return commits
+ 
+ 
++def _workflow_enabled(value) -> bool:
++    if value is True:
++        return True
++    if isinstance(value, str):
++        return value.strip().lower() in ("1", "true", "yes", "on")
++    return False
++
++
+ def _workflow_rows() -> list[dict]:
+     import time as _t
+     if not PROJECTS_DIR.exists():
+@@ -2015,16 +2023,19 @@
+         if not pr:
+             continue
+         wf = pr.get("workflow") or {}
+-        if wf.get("enabled") is not True:
++        enabled = _workflow_enabled(wf.get("enabled"))
++        if not enabled:
++            log.debug("skipping project %s: workflow.enabled=%r", p.stem, wf.get("enabled"))
+             continue
+         active_task_id = wf.get("active_task_id")
+         active_task = next((t for t in (pr.get("tasks") or []) if t.get("id") == active_task_id), None)
++        events = _read_phase_events(20, pr.get("slug"))
+         rows.append({
+             "project_slug": pr.get("slug"),
+             "project_name": pr.get("name"),
+             "active_task_title": (active_task or {}).get("title"),
+             "workflow": {
+-                "enabled": wf.get("enabled"),
++                "enabled": enabled,
+                 "coordinator_agent": wf.get("coordinator_agent"),
+                 "auto_commit": wf.get("auto_commit"),
+                 "auto_push": wf.get("auto_push"),
+@@ -2036,7 +2047,8 @@
+                 "coordinator_auto_approve": wf.get("coordinator_auto_approve"),
+                 "pending_review_path": wf.get("pending_review_path"),
+             },
+-            "events": _read_phase_events(20, pr.get("slug")),
++            "events": events,
++            "recent_phase_events": events,
+         })
+     _WORKFLOWS_CACHE.update({"ts": now, "mtime_key": mtime_key, "rows": rows})
+     return rows
