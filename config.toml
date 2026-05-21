@@ -88,6 +88,54 @@ label = "Hermes"
 api_key_env = "OPENROUTER_API_KEY"
 temperature = 0.7
 
+[agents.flux]
+command = "/Users/zeroclaw/agentos/agents/flux/flux-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#14b8a6"
+label = "Flux"
+api_key_env = "FAL_KEY"
+
+[agents.dalle]
+command = "/Users/zeroclaw/agentos/agents/dalle/dalle-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#22c55e"
+label = "DALL-E"
+api_key_env = "OPENAI_API_KEY"
+
+[agents.kling]
+command = "/Users/zeroclaw/agentos/agents/kling/kling-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#f59e0b"
+label = "Kling"
+api_key_env = "KLING_API_KEY"
+
+[agents.sora]
+command = "/Users/zeroclaw/agentos/agents/sora/sora-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#0ea5e9"
+label = "Sora"
+api_key_env = "OPENAI_API_KEY"
+
+[agents.veo]
+command = "/Users/zeroclaw/agentos/agents/veo/veo-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#84cc16"
+label = "Veo"
+api_key_env = "GEMINI_API_KEY"
+
+[agents.comfyui]
+command = "/Users/zeroclaw/agentos/agents/comfyui/comfyui-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#ec4899"
+label = "ComfyUI"
+
+[agents.cogvideox]
+command = "/Users/zeroclaw/agentos/agents/cogvideox/cogvideox-wrapper.sh"
+cwd = "/Users/zeroclaw/agentos"
+color = "#a855f7"
+label = "CogVideoX"
+api_key_env = "ZHIPU_API_KEY"
+
 [routing]
 # "none" = only route on explicit @mention. "all" = route to all agents by default.
 default = "none"

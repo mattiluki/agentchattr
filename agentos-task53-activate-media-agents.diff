@@ -1,0 +1,465 @@
+diff --git a/serve.py b/serve.py
+index c8f3aca..758d531 100644
+--- a/serve.py
++++ b/serve.py
+@@ -106,23 +106,37 @@ _KNOWN_AGENTS = [
+     ("kimi",        "#1783ff", "kimi-k2",               "kimi",    True),   # Phase A2
+     ("qwen",        "#8b5cf6", "qwen2.5",               "qwen",    True),   # Phase A2
+     ("kilo",        "#f7f677", "kilo-1",                "kilo",    False),  # transport mismatch
++    ("minimax",     "#2fe898", "MiniMax-M2.5",          "minimax", True),
++    ("openrouter",  "#ff7a1a", "openrouter",            "openrouter", True),
++    ("hermes",      "#d946ef", "hermes-3",              "hermes",  True),
++    ("flux",        "#14b8a6", "flux-pro",              "flux",    True),
++    ("dalle",       "#22c55e", "dall-e-3",              "dalle",   True),
++    ("kling",       "#f59e0b", "kling-v1-6",            "kling",   True),
++    ("sora",        "#0ea5e9", "sora-2",                "sora",    True),
++    ("veo",         "#84cc16", "veo-3",                 "veo",     True),
++    ("comfyui",     "#ec4899", "comfyui",               "comfyui", True),
++    ("cogvideox",   "#a855f7", "CogVideoX-2b",          "cogvideox", True),
+ ]
+ _KNOWN_AGENT_SLUGS = {slug for slug, *_ in _KNOWN_AGENTS}
+ _FLEET_COST_CACHE = {"key": None, "ts": 0.0, "value": None}
+ 
+ 
+ def _ps_running_wrappers() -> set[str]:
+-    """Return the set of agent slugs whose agentchattr wrapper.py is currently running."""
++    """Return agent slugs whose wrapper or media agent process is running."""
+     try:
+         out = subprocess.run(
+-            ["pgrep", "-fl", "wrapper.py"],
++            ["pgrep", "-fl", "wrapper.py|wrapper_api.py|agents/.+_agent.py"],
+             capture_output=True, text=True, timeout=2,
+         ).stdout
+     except Exception:
+         return set()
+     found: set[str] = set()
+     for line in out.splitlines():
+-        m = re.search(r"wrapper\.py\s+(\w+)", line)
++        m = re.search(r"wrapper(?:_api)?\.py\s+(\w+)", line)
++        if m:
++            found.add(m.group(1))
++            continue
++        m = re.search(r"agents/([a-z0-9]+)_agent\.py", line)
+         if m:
+             found.add(m.group(1))
+     return found
+diff --git a/Users/zeroclaw/agentos/agents/flux/flux-wrapper.sh b/Users/zeroclaw/agentos/agents/flux/flux-wrapper.sh
+new file mode 100755
+index 0000000..28276f8
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/flux/flux-wrapper.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++load_key() {
++  key="$1"
++  eval "current=\${$key:-}"
++  if [ -z "$current" ] && command -v security >/dev/null 2>&1; then
++    value="$(security find-generic-password -s "agentos.$key" -w 2>/dev/null || true)"
++    if [ -n "$value" ]; then
++      export "$key=$value"
++    fi
++  fi
++}
++
++load_key FAL_KEY
++exec .venv/bin/python agents/flux_agent.py
+diff --git a/Users/zeroclaw/agentos/agents/dalle/dalle-wrapper.sh b/Users/zeroclaw/agentos/agents/dalle/dalle-wrapper.sh
+new file mode 100755
+index 0000000..4313d4d
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/dalle/dalle-wrapper.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++load_key() {
++  key="$1"
++  eval "current=\${$key:-}"
++  if [ -z "$current" ] && command -v security >/dev/null 2>&1; then
++    value="$(security find-generic-password -s "agentos.$key" -w 2>/dev/null || true)"
++    if [ -n "$value" ]; then
++      export "$key=$value"
++    fi
++  fi
++}
++
++load_key OPENAI_API_KEY
++exec .venv/bin/python agents/dalle_agent.py
+diff --git a/Users/zeroclaw/agentos/agents/kling/kling-wrapper.sh b/Users/zeroclaw/agentos/agents/kling/kling-wrapper.sh
+new file mode 100755
+index 0000000..b82d61d
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/kling/kling-wrapper.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++load_key() {
++  key="$1"
++  eval "current=\${$key:-}"
++  if [ -z "$current" ] && command -v security >/dev/null 2>&1; then
++    value="$(security find-generic-password -s "agentos.$key" -w 2>/dev/null || true)"
++    if [ -n "$value" ]; then
++      export "$key=$value"
++    fi
++  fi
++}
++
++load_key KLING_API_KEY
++load_key KLING_ACCESS_KEY
++load_key KLING_SECRET_KEY
++exec .venv/bin/python agents/kling_agent.py
+diff --git a/Users/zeroclaw/agentos/agents/sora/sora-wrapper.sh b/Users/zeroclaw/agentos/agents/sora/sora-wrapper.sh
+new file mode 100755
+index 0000000..e84da79
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/sora/sora-wrapper.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++load_key() {
++  key="$1"
++  eval "current=\${$key:-}"
++  if [ -z "$current" ] && command -v security >/dev/null 2>&1; then
++    value="$(security find-generic-password -s "agentos.$key" -w 2>/dev/null || true)"
++    if [ -n "$value" ]; then
++      export "$key=$value"
++    fi
++  fi
++}
++
++load_key OPENAI_API_KEY
++exec .venv/bin/python agents/sora_agent.py
+diff --git a/Users/zeroclaw/agentos/agents/veo/veo-wrapper.sh b/Users/zeroclaw/agentos/agents/veo/veo-wrapper.sh
+new file mode 100755
+index 0000000..ff5c6b5
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/veo/veo-wrapper.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++load_key() {
++  key="$1"
++  eval "current=\${$key:-}"
++  if [ -z "$current" ] && command -v security >/dev/null 2>&1; then
++    value="$(security find-generic-password -s "agentos.$key" -w 2>/dev/null || true)"
++    if [ -n "$value" ]; then
++      export "$key=$value"
++    fi
++  fi
++}
++
++load_key GOOGLE_APPLICATION_CREDENTIALS
++load_key GOOGLE_CLOUD_PROJECT
++load_key GEMINI_API_KEY
++exec .venv/bin/python agents/veo_agent.py
+diff --git a/Users/zeroclaw/agentos/agents/comfyui/comfyui-wrapper.sh b/Users/zeroclaw/agentos/agents/comfyui/comfyui-wrapper.sh
+new file mode 100755
+index 0000000..9b4147c
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/comfyui/comfyui-wrapper.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++if ! curl -fsS http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then
++  echo "needs_provider_access: ComfyUI is not reachable at http://127.0.0.1:8188" >&2
++fi
++
++exec .venv/bin/python agents/comfyui_agent.py
+diff --git a/Users/zeroclaw/agentos/agents/cogvideox/cogvideox-wrapper.sh b/Users/zeroclaw/agentos/agents/cogvideox/cogvideox-wrapper.sh
+new file mode 100755
+index 0000000..fe00c70
+--- /dev/null
++++ b/Users/zeroclaw/agentos/agents/cogvideox/cogvideox-wrapper.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env sh
++set -eu
++cd /Users/zeroclaw/agentos
++
++load_key() {
++  key="$1"
++  eval "current=\${$key:-}"
++  if [ -z "$current" ] && command -v security >/dev/null 2>&1; then
++    value="$(security find-generic-password -s "agentos.$key" -w 2>/dev/null || true)"
++    if [ -n "$value" ]; then
++      export "$key=$value"
++    fi
++  fi
++}
++
++load_key ZHIPU_API_KEY
++load_key HF_TOKEN
++exec .venv/bin/python agents/cogvideox_agent.py
+diff --git a/config.toml b/config.toml
+index 9bd214c..05c7f53 100644
+--- a/config.toml
++++ b/config.toml
+@@ -88,6 +88,54 @@ label = "Hermes"
+ api_key_env = "OPENROUTER_API_KEY"
+ temperature = 0.7
+ 
++[agents.flux]
++command = "/Users/zeroclaw/agentos/agents/flux/flux-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#14b8a6"
++label = "Flux"
++api_key_env = "FAL_KEY"
++
++[agents.dalle]
++command = "/Users/zeroclaw/agentos/agents/dalle/dalle-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#22c55e"
++label = "DALL-E"
++api_key_env = "OPENAI_API_KEY"
++
++[agents.kling]
++command = "/Users/zeroclaw/agentos/agents/kling/kling-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#f59e0b"
++label = "Kling"
++api_key_env = "KLING_API_KEY"
++
++[agents.sora]
++command = "/Users/zeroclaw/agentos/agents/sora/sora-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#0ea5e9"
++label = "Sora"
++api_key_env = "OPENAI_API_KEY"
++
++[agents.veo]
++command = "/Users/zeroclaw/agentos/agents/veo/veo-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#84cc16"
++label = "Veo"
++api_key_env = "GEMINI_API_KEY"
++
++[agents.comfyui]
++command = "/Users/zeroclaw/agentos/agents/comfyui/comfyui-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#ec4899"
++label = "ComfyUI"
++
++[agents.cogvideox]
++command = "/Users/zeroclaw/agentos/agents/cogvideox/cogvideox-wrapper.sh"
++cwd = "/Users/zeroclaw/agentos"
++color = "#a855f7"
++label = "CogVideoX"
++api_key_env = "ZHIPU_API_KEY"
++
+ [routing]
+ # "none" = only route on explicit @mention. "all" = route to all agents by default.
+ default = "none"
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-flux.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-flux.plist
+new file mode 100644
+index 0000000..57bb94c
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-flux.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-flux</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/flux/flux-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/flux.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/flux.launchd.err</string>
++</dict>
++</plist>
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-dalle.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-dalle.plist
+new file mode 100644
+index 0000000..95b8718
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-dalle.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-dalle</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/dalle/dalle-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/dalle.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/dalle.launchd.err</string>
++</dict>
++</plist>
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-kling.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-kling.plist
+new file mode 100644
+index 0000000..e4cf2da
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-kling.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-kling</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/kling/kling-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/kling.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/kling.launchd.err</string>
++</dict>
++</plist>
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-sora.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-sora.plist
+new file mode 100644
+index 0000000..bd4c21f
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-sora.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-sora</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/sora/sora-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/sora.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/sora.launchd.err</string>
++</dict>
++</plist>
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-veo.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-veo.plist
+new file mode 100644
+index 0000000..bb07ebb
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-veo.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-veo</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/veo/veo-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/veo.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/veo.launchd.err</string>
++</dict>
++</plist>
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-comfyui.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-comfyui.plist
+new file mode 100644
+index 0000000..78a42f2
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-comfyui.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-comfyui</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/comfyui/comfyui-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/comfyui.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/comfyui.launchd.err</string>
++</dict>
++</plist>
+diff --git a/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-cogvideox.plist b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-cogvideox.plist
+new file mode 100644
+index 0000000..85b3eb3
+--- /dev/null
++++ b/Users/zeroclaw/Documents/agentchattr/macos-linux/launch-agents/com.user.agentchattr-cogvideox.plist
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>Label</key>
++  <string>com.user.agentchattr-cogvideox</string>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/bin/sh</string>
++    <string>/Users/zeroclaw/agentos/agents/cogvideox/cogvideox-wrapper.sh</string>
++  </array>
++  <key>WorkingDirectory</key>
++  <string>/Users/zeroclaw/agentos</string>
++  <key>RunAtLoad</key>
++  <true/>
++  <key>KeepAlive</key>
++  <true/>
++  <key>StandardOutPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/cogvideox.launchd.log</string>
++  <key>StandardErrorPath</key>
++  <string>/Users/zeroclaw/Documents/agentchattr/data/cogvideox.launchd.err</string>
++</dict>
++</plist>
