@@ -1,0 +1,473 @@
+diff --git a/serve.py b/serve.py
+index bffdf2c..f99e58f 100644
+--- a/serve.py
++++ b/serve.py
+@@ -37,6 +37,7 @@ AGENT_CONFIG_REL = "02-Areas/AI-Automation/AgentOS/runtime/agent-config.yaml"
+ AGENT_CONFIG_PATH = VAULT / AGENT_CONFIG_REL
+ MODEL_LIMITS_REL = "02-Areas/AI-Automation/AgentOS/runtime/model-limits.md"
+ MODEL_LIMITS_PATH = VAULT / MODEL_LIMITS_REL
++ENV_PATH = Path.home() / "agentos" / ".env"
+ 
+ # Import vault_mcp from the vault's scripts dir so we can call its tool
+ # functions directly without spawning a subprocess per request.
+@@ -850,6 +851,36 @@ async def inbox_approve(proposal_id: str):
+     target_rel = fm.get("target_path")
+     if not target_rel:
+         return {"error": "proposal missing target_path frontmatter"}
++    if fm.get("operation") == "env_patch":
++        import json as _json
++        body = text
++        if text.startswith("---\n"):
++            end = text.find("\n---\n", 4)
++            if end != -1:
++                body = text[end + 5 :]
++        try:
++            patch = _json.loads(body)
++        except Exception as e:
++            return {"error": f"invalid env patch proposal: {e}"}
++        name = (patch.get("name") or "").strip().upper()
++        action = (patch.get("action") or "set").strip().lower()
++        if not re.match(r"^[A-Z_][A-Z0-9_]*$", name):
++            return {"error": "env key must match ^[A-Z_][A-Z0-9_]*$"}
++        if action not in ("set", "add", "unset", "delete"):
++            return {"error": "action must be set, add, unset, or delete"}
++        _apply_env_patch(name, str(patch.get("value") or ""), action)
++        applied = VAULT / "00-Inbox" / "Applied"
++        applied.mkdir(parents=True, exist_ok=True)
++        import shutil
++        shutil.move(str(src), str(applied / src.name))
++        _record_security_event("env-applied", f"applied env patch for {name}", {
++            "agent": fm.get("agent_id") or "codex",
++            "task_id": fm.get("task_id") or 50,
++            "key": name,
++            "action": action,
++            "target_path": target_rel,
++        })
++        return {"ok": True, "applied_to": str(ENV_PATH), "archived_to": str((applied / src.name).relative_to(VAULT))}
+     target = VAULT / target_rel
+     target.parent.mkdir(parents=True, exist_ok=True)
+     # Atomic-ish move
+@@ -3963,8 +3994,20 @@ SECRET_KEY_EXACT = {
+     "ANTHROPIC_API_KEY",
+     "GEMINI_API_KEY",
+     "GOOGLE_API_KEY",
++    "GOOGLE_CLOUD_API_KEY",
+     "OPENROUTER_API_KEY",
++    "FAL_KEY",
++    "KLING_API_KEY",
+ }
++DEFAULT_API_KEY_NAMES = [
++    "OPENROUTER_API_KEY",
++    "GEMINI_API_KEY",
++    "GOOGLE_CLOUD_API_KEY",
++    "ANTHROPIC_API_KEY",
++    "OPENAI_API_KEY",
++    "FAL_KEY",
++    "KLING_API_KEY",
++]
+ 
+ 
+ def _is_secret_env_key(key: str) -> bool:
+@@ -3972,6 +4015,129 @@ def _is_secret_env_key(key: str) -> bool:
+     return normalized in SECRET_KEY_EXACT or any(marker in normalized for marker in SECRET_KEY_MARKERS)
+ 
+ 
++def _dotenv_entries(path: Path | None = None) -> tuple[list[dict], dict[str, str]]:
++    path = path or ENV_PATH
++    entries: list[dict] = []
++    values: dict[str, str] = {}
++    if not path.exists():
++        return entries, values
++    try:
++        lines = path.read_text(encoding="utf-8").splitlines()
++    except (OSError, UnicodeDecodeError) as e:
++        log.warning(f"dotenv read failed: {e}")
++        return entries, values
++    for idx, line in enumerate(lines):
++        stripped = line.strip()
++        if not stripped or stripped.startswith("#") or "=" not in stripped:
++            entries.append({"kind": "raw", "line": line})
++            continue
++        key, value = stripped.split("=", 1)
++        key = key.strip()
++        value = value.strip()
++        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
++            value = value[1:-1]
++        entries.append({"kind": "env", "key": key, "value": value, "line": line, "index": idx})
++        values[key] = value
++    return entries, values
++
++
++def _mask_env_value(value: str) -> str:
++    if not value:
++        return "(unset)"
++    suffix = value[-4:] if len(value) > 4 else value
++    return f"••••••••{suffix}"
++
++
++def _settings_env_rows() -> list[dict]:
++    import os as _os
++    entries, values = _dotenv_entries()
++    names = set(DEFAULT_API_KEY_NAMES)
++    names.update(key for key in values if _is_secret_env_key(key))
++    names.update(key for key in _os.environ if _is_secret_env_key(key))
++    try:
++        mtime = ENV_PATH.stat().st_mtime if ENV_PATH.exists() else None
++    except OSError:
++        mtime = None
++    rows = []
++    for name in sorted(names):
++        dotenv_value = values.get(name, "")
++        process_value = _os.environ.get(name, "")
++        value = dotenv_value or process_value
++        rows.append({
++            "name": name,
++            "key": name,
++            "masked_value": _mask_env_value(value),
++            "value": _mask_env_value(value),
++            "set": bool(value),
++            "source": "dotenv" if dotenv_value else "process" if process_value else "unset",
++            "last_modified": mtime,
++            "env_path": str(ENV_PATH),
++        })
++    return rows
++
++
++def _settings_env_proposal_filename(name: str) -> str:
++    import datetime as _dt
++    safe = re.sub(r"[^A-Z0-9_]+", "-", name.upper()).strip("-") or "ENV"
++    stamp = _dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
++    return f"{stamp}_env-patch-{safe}.md"
++
++
++def _write_env_patch_proposal(name: str, value: str, action: str) -> dict:
++    import datetime as _dt
++    import json as _json
++    import yaml as _yaml
++    outgoing = VAULT / "00-Inbox" / "Outgoing"
++    outgoing.mkdir(parents=True, exist_ok=True)
++    proposed_at = _dt.datetime.now().isoformat(timespec="seconds")
++    target_path = f"secrets-out-of-vault/env-patch-{name}-{proposed_at}.json"
++    fm = {
++        "type": "proposal",
++        "target_path": target_path,
++        "operation": "env_patch",
++        "agent_id": "codex",
++        "rationale": f"Update {name} in ~/agentos/.env from Settings UI",
++        "proposed_at": proposed_at,
++        "task_id": 50,
++    }
++    body = {
++        "env_path": str(ENV_PATH),
++        "name": name,
++        "value": value,
++        "action": action,
++    }
++    text = "---\n" + _yaml.safe_dump(fm, sort_keys=False).strip() + "\n---\n"
++    text += _json.dumps(body, indent=2, sort_keys=True) + "\n"
++    target = outgoing / _settings_env_proposal_filename(name)
++    target.write_text(text, encoding="utf-8")
++    return {
++        "id": target.stem,
++        "path": str(target.relative_to(VAULT)),
++        "proposal_path": str(target.relative_to(VAULT)),
++        "target_path": target_path,
++        "proposed_at": proposed_at,
++    }
++
++
++def _apply_env_patch(name: str, value: str, action: str) -> None:
++    entries, _values = _dotenv_entries()
++    output = []
++    seen = False
++    action = action.lower()
++    for entry in entries:
++        if entry.get("kind") != "env" or entry.get("key") != name:
++            output.append(entry.get("line", ""))
++            continue
++        seen = True
++        if action in ("delete", "unset"):
++            continue
++        output.append(f"{name}={value}")
++    if not seen and action in ("set", "add"):
++        output.append(f"{name}={value}")
++    ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
++    ENV_PATH.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
++
++
+ def _agent_settings_defaults() -> dict:
+     agents = {}
+     for slug, options in AGENT_MODELS.items():
+@@ -4124,6 +4290,60 @@ async def settings_get():
+     return _settings_payload()
+ 
+ 
++@app.get("/api/settings/env")
++async def settings_env_get():
++    return {
++        "keys": _settings_env_rows(),
++        "env_path": str(ENV_PATH),
++        "exists": ENV_PATH.exists(),
++    }
++
++
++@app.get("/api/settings/env/{name}/reveal")
++async def settings_env_reveal(name: str):
++    key = name.strip().upper()
++    if not re.match(r"^[A-Z_][A-Z0-9_]*$", key):
++        return {"error": "env key must match ^[A-Z_][A-Z0-9_]*$"}
++    import os as _os
++    _entries, values = _dotenv_entries()
++    value = values.get(key, _os.environ.get(key, ""))
++    _record_security_event("env-reveal", f"revealed env key {key}", {
++        "agent": "user",
++        "task_id": 50,
++        "key": key,
++        "source": "dotenv" if key in values else "process" if key in _os.environ else "unset",
++    })
++    return {"name": key, "value": value, "set": bool(value)}
++
++
++@app.put("/api/settings/env")
++async def settings_env_secret_put(payload: dict):
++    name = (payload.get("name") or payload.get("key") or "").strip().upper()
++    value = str(payload.get("value") or "")
++    action = (payload.get("action") or "set").strip().lower()
++    if not re.match(r"^[A-Z_][A-Z0-9_]*$", name):
++        return {"error": "env key must match ^[A-Z_][A-Z0-9_]*$"}
++    if action not in ("set", "add", "unset", "delete"):
++        return {"error": "action must be set, add, unset, or delete"}
++    if action in ("set", "add") and not _is_secret_env_key(name):
++        return {"error": f"{name} does not look like an API key or secret"}
++    proposal = _write_env_patch_proposal(name, value, action)
++    _record_security_event("env-proposal-created", f"queued env patch for {name}", {
++        "agent": "user",
++        "task_id": 50,
++        "key": name,
++        "action": action,
++        "proposal": proposal.get("path"),
++    })
++    return {
++        "ok": True,
++        "proposal": proposal,
++        "proposal_path": proposal.get("proposal_path"),
++        "next_step": "review the proposal in Inbox, then approve it to update ~/agentos/.env",
++        "keys": _settings_env_rows(),
++    }
++
++
+ @app.post("/api/settings/env")
+ async def settings_env_put(payload: dict):
+     key = (payload.get("key") or "").strip().upper()
+@@ -4179,17 +4399,17 @@ def _translate_allowlist(slug: str, allowlist: dict) -> dict:
+ def _record_security_event(kind: str, summary: str, extra: dict | None = None):
+     import datetime as _dt
+     import json as _json
++    extra = extra or {}
+     event = {
+         "kind": kind,
+         "project": "agentos-roadmap",
+-        "task_id": 38,
++        "task_id": extra.get("task_id") or 38,
+         "phase": "Build",
+-        "agent": (extra or {}).get("agent"),
++        "agent": extra.get("agent"),
+         "ts": _dt.datetime.now().isoformat(timespec="seconds"),
+         "summary": summary,
+     }
+-    if extra:
+-        event.update(extra)
++    event.update(extra)
+     try:
+         PHASE_EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+         with PHASE_EVENTS_LOG.open("a", encoding="utf-8") as f:
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index 61488b4..7c683df 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -2160,6 +2160,29 @@ html[data-theme="dark"] .links-add-btn.on { color: #0a0b0d; }
+   padding: 8px 12px;
+ }
+ .settings-add-row { background: var(--bg-sunken); }
++.settings-api-key-list { display: flex; flex-direction: column; }
++.settings-api-key-row {
++  display: grid;
++  grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1fr) 76px minmax(230px, auto);
++  gap: 12px;
++  align-items: center;
++  padding: 10px 12px;
++  border-bottom: 1px solid var(--line);
++  font-size: 13px;
++}
++.settings-api-key-row:last-child { border-bottom: 0; }
++.settings-api-key-head {
++  background: var(--bg-sunken);
++  color: var(--ink-3);
++  font-size: 10px;
++  text-transform: uppercase;
++  letter-spacing: 0.08em;
++  padding: 8px 12px;
++}
++.settings-api-key-name { overflow-wrap: anywhere; }
++.settings-api-key-actions { display: flex; justify-content: flex-end; gap: 6px; }
++.settings-api-key-actions .btn-sm { min-width: 48px; }
++.settings-api-key-add-row { background: var(--bg-sunken); }
+ .agent-settings-list { display: flex; flex-direction: column; }
+ .agent-settings-row {
+   display: grid;
+@@ -2293,6 +2316,12 @@ button.toggle-switch {
+   .settings-nav-item { white-space: nowrap; flex-shrink: 0; }
+   .settings-nav-danger { margin-top: 0; }
+   .settings-main { padding: 16px 12px; }
++  .settings-row,
++  .settings-api-key-row,
++  .agent-settings-row { grid-template-columns: 1fr; }
++  .settings-head,
++  .settings-api-key-head { display: none; }
++  .settings-api-key-actions { justify-content: flex-start; flex-wrap: wrap; }
+   .team-row { grid-template-columns: 1fr; gap: 4px; padding: 12px; }
+   .team-head { display: none; }
+   .api-key-row { grid-template-columns: 1fr; }
+diff --git a/ui-static/screens/settings.jsx b/ui-static/screens/settings.jsx
+index f6b6c78..cfa4421 100644
+--- a/ui-static/screens/settings.jsx
++++ b/ui-static/screens/settings.jsx
+@@ -35,6 +35,7 @@ function SettingsScreen() {
+ 
+   const sections = [
+     { id: "env", label: "Env vars", glyph: "▤" },
++    { id: "api", label: "API Keys", glyph: "◈" },
+     { id: "agents", label: "Agents", glyph: "◉" },
+   ];
+ 
+@@ -72,6 +73,7 @@ function SettingsScreen() {
+           {!loading && error && <div className="settings-alert settings-alert-error mono">{error}</div>}
+           {!loading && notice && <div className="settings-alert settings-alert-ok mono">{notice}</div>}
+           {!loading && section === "env" && <EnvSettings settings={settings} onResult={onResult} />}
++          {!loading && section === "api" && <ApiKeysSection onResult={onResult} />}
+           {!loading && section === "agents" && <AgentSettings settings={settings} onResult={onResult} />}
+         </main>
+       </div>
+@@ -136,6 +138,122 @@ function EnvSettings({ settings, onResult }) {
+   );
+ }
+ 
++function ApiKeysSection({ onResult }) {
++  const [payload, setPayload] = useState({ keys: [] });
++  const [drafts, setDrafts] = useState({});
++  const [visible, setVisible] = useState({});
++  const [editing, setEditing] = useState({});
++  const [pending, setPending] = useState({});
++  const [localError, setLocalError] = useState("");
++  const [newName, setNewName] = useState("");
++  const [newValue, setNewValue] = useState("");
++
++  const load = React.useCallback(async () => {
++    try {
++      const r = await fetch("/api/settings/env");
++      const data = await r.json();
++      setPayload(data);
++      setLocalError(data.error || "");
++    } catch (e) {
++      setLocalError(String(e).slice(0, 160));
++    }
++  }, []);
++
++  React.useEffect(() => { load(); }, [load]);
++
++  const reveal = async (name) => {
++    if (visible[name]) {
++      setVisible({ ...visible, [name]: false });
++      return;
++    }
++    const r = await fetch(`/api/settings/env/${encodeURIComponent(name)}/reveal`);
++    const data = await r.json();
++    if (data.error) {
++      setLocalError(data.error);
++      return;
++    }
++    setDrafts({ ...drafts, [name]: data.value || "" });
++    setVisible({ ...visible, [name]: true });
++    setLocalError("");
++  };
++
++  const save = async (name, value, action = "set") => {
++    setPending({ ...pending, [name]: true });
++    const r = await fetch("/api/settings/env", {
++      method: "PUT",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ name, value, action }),
++    });
++    const data = await r.json();
++    setPending({ ...pending, [name]: false });
++    if (data.error) {
++      setLocalError(data.error);
++      onResult(data);
++      return;
++    }
++    setEditing({ ...editing, [name]: false });
++    setVisible({ ...visible, [name]: false });
++    setLocalError("");
++    onResult(data);
++    await load();
++  };
++
++  const add = async () => {
++    const name = newName.trim().toUpperCase();
++    if (!name) return;
++    await save(name, newValue, "add");
++    setNewName("");
++    setNewValue("");
++  };
++
++  const rows = payload.keys || [];
++
++  return (
++    <SettingsPage title="API Keys" sub={`${payload.env_path || "~/agentos/.env"} · writes queue HITL approval`}>
++      {localError && <div className="settings-alert settings-alert-error mono">{localError}</div>}
++      <SettingsCard title="Secrets">
++        <div className="settings-api-key-list">
++          <div className="settings-api-key-row settings-api-key-head mono"><span>key</span><span>value</span><span>state</span><span></span></div>
++          {rows.length === 0 && <div className="muted mono" style={{ padding: 12 }}>no API keys found</div>}
++          {rows.map((row) => {
++            const name = row.name || row.key;
++            const shown = !!visible[name] || !!editing[name];
++            const value = drafts[name] !== undefined ? drafts[name] : "";
++            return (
++              <div className="settings-api-key-row" key={name}>
++                <span className="mono settings-api-key-name">{name}</span>
++                <input className="inp mono"
++                  type={shown ? "text" : "password"}
++                  value={shown ? value : row.masked_value}
++                  readOnly={!editing[name]}
++                  onChange={(e) => setDrafts({ ...drafts, [name]: e.target.value })} />
++                <span className={"mono " + (row.set ? "txt-ok" : "muted")}>{row.set ? row.source : "unset"}</span>
++                <div className="settings-api-key-actions">
++                  <button className="btn btn-ghost btn-sm" onClick={() => reveal(name)}>{visible[name] ? "hide" : "show"}</button>
++                  <button className="btn btn-ghost btn-sm" onClick={() => {
++                    if (!visible[name]) reveal(name);
++                    setEditing({ ...editing, [name]: true });
++                  }}>edit</button>
++                  <button className="btn btn-primary btn-sm" disabled={!editing[name] || pending[name]}
++                    onClick={() => save(name, value)}>{pending[name] ? "queueing" : "save"}</button>
++                </div>
++              </div>
++            );
++          })}
++          <div className="settings-api-key-row settings-api-key-add-row">
++            <input className="inp mono" placeholder="NEW_API_KEY" value={newName} onChange={(e) => setNewName(e.target.value.toUpperCase())} />
++            <input className="inp mono" type="password" placeholder="value" value={newValue} onChange={(e) => setNewValue(e.target.value)} />
++            <span className="muted mono">new</span>
++            <div className="settings-api-key-actions">
++              <button className="btn btn-primary btn-sm" disabled={!newName.trim() || pending[newName.trim().toUpperCase()]} onClick={add}>add</button>
++            </div>
++          </div>
++        </div>
++      </SettingsCard>
++    </SettingsPage>
++  );
++}
++
+ function AgentSettings({ settings, onResult }) {
+   const [drafts, setDrafts] = useState({});
+   const rows = settings?.agents || [];
