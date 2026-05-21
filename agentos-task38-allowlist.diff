@@ -1,0 +1,1297 @@
+diff --git a/serve.py b/serve.py
+index 42ee17c..3e459dc 100644
+--- a/serve.py
++++ b/serve.py
+@@ -17,9 +17,10 @@ import re
+ import subprocess
+ import sys
+ import urllib.parse
++import time
+ from pathlib import Path
+ 
+-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
++from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.staticfiles import StaticFiles
+ 
+@@ -31,6 +32,10 @@ VAULT = Path.home() / "Documents" / "obsidian" / "LosAgentOS"
+ VAULT_SCRIPTS = VAULT / ".claude" / "scripts"
+ AGENTCHATTR = Path.home() / "Documents" / "agentchattr"
+ AGENTCHATTR_DATA = AGENTCHATTR / "data"
++AGENT_CONFIG_REL = "02-Areas/AI-Automation/AgentOS/runtime/agent-config.yaml"
++AGENT_CONFIG_PATH = VAULT / AGENT_CONFIG_REL
++MODEL_LIMITS_REL = "02-Areas/AI-Automation/AgentOS/runtime/model-limits.md"
++MODEL_LIMITS_PATH = VAULT / MODEL_LIMITS_REL
+ 
+ # Import vault_mcp from the vault's scripts dir so we can call its tool
+ # functions directly without spawning a subprocess per request.
+@@ -43,6 +48,12 @@ except Exception as e:  # pragma: no cover
+     vault_mcp = None
+     VAULT_MCP_OK = False
+ 
++try:
++    import permissions as agent_permissions  # noqa: E402
++except Exception as e:  # pragma: no cover
++    log.warning(f"permissions import failed: {e}; allowlist APIs will use local fallbacks")
++    agent_permissions = None
++
+ app = FastAPI(
+     title="AgentOS UI server",
+     description="Stage 2 -- static prototype + live data overlay endpoints.",
+@@ -82,6 +93,7 @@ _KNOWN_AGENTS = [
+     ("qwen",        "#8b5cf6", "qwen2.5",               "qwen",    True),   # Phase A2
+     ("kilo",        "#f7f677", "kilo-1",                "kilo",    False),  # transport mismatch
+ ]
++_KNOWN_AGENT_SLUGS = {slug for slug, *_ in _KNOWN_AGENTS}
+ 
+ 
+ def _ps_running_wrappers() -> set[str]:
+@@ -474,6 +486,12 @@ async def chat_send(payload: dict):
+     channel = payload.get("channel", "general")
+     sender = payload.get("sender", "user")
+     reply_to = payload.get("reply_to")
++    disabled_mentions = _disabled_agents_in_text(text)
++    if disabled_mentions:
++        return {
++            "error": "disabled agent routing refused",
++            "disabled_agents": disabled_mentions,
++        }
+ 
+     # Stage 10/11/12: inject (in order)
+     #   - project context (long-lived shared brief — what is this project)
+@@ -2974,6 +2992,296 @@ async def stream_agent_pane(websocket: WebSocket, slug: str):
+         log.info(f"WS closed for {session!r}")
+ 
+ 
++# ── Per-agent context-window inspector ─────────────────────────────────────
++# Read-only transcript browser over local CLI session files. Bodies stay on
++# disk; endpoints parse and slice the source files on request.
++
++INSPECTOR_ROOTS = {
++    "claude": Path.home() / ".claude" / "projects",
++    "codex": Path.home() / ".codex" / "sessions",
++    "gemini": Path.home() / ".gemini" / "tmp",
++}
++INSPECTOR_LIMITS_FALLBACK = {
++    "claude-opus-4-7": {"context": 200000, "output": 64000},
++    "claude-sonnet-4-6": {"context": 1000000, "output": 64000},
++    "claude-haiku-4-5": {"context": 200000, "output": 64000},
++    "gpt-5.5": {"context": 258400, "output": 128000},
++    "gpt-5": {"context": 258400, "output": 128000},
++    "gpt-4o": {"context": 128000, "output": 16384},
++    "gemini-2.5-flash": {"context": 1000000, "output": 65000},
++    "gemini-2.5-pro": {"context": 2000000, "output": 65000},
++    "gemini-3-flash-preview": {"context": 1000000, "output": 65000},
++}
++_INSPECTOR_WS_CLIENTS: set = set()
++_INSPECTOR_MTIME_SNAPSHOT: dict[str, int] = {}
++
++
++def _estimate_tokens(text: str) -> int:
++    return max(1, int(len(text or "") / 4)) if text else 0
++
++
++def _content_to_text(content) -> str:
++    if content is None:
++        return ""
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = []
++        for item in content:
++            if isinstance(item, str):
++                parts.append(item)
++            elif isinstance(item, dict):
++                label = item.get("type") or "content"
++                text = item.get("text") or item.get("thinking") or item.get("content")
++                if text:
++                    parts.append(f"[{label}] {text}" if label not in ("text", "content") else str(text))
++                elif item and "signature" not in item:
++                    parts.append(f"[{label}] {item}")
++            else:
++                parts.append(str(item))
++        return "\n".join(parts)
++    if isinstance(content, dict):
++        return content.get("text") or content.get("content") or str(content)
++    return str(content)
++
++
++def _extract_yaml_block(text: str) -> str:
++    if "```yaml" in text:
++        start = text.find("```yaml") + len("```yaml")
++        end = text.find("```", start)
++        return text[start:end].strip() if end != -1 else text[start:].strip()
++    if "```" in text:
++        start = text.find("```") + 3
++        end = text.find("```", start)
++        return text[start:end].strip() if end != -1 else text[start:].strip()
++    return text
++
++
++def _model_limits() -> dict:
++    limits = dict(INSPECTOR_LIMITS_FALLBACK)
++    if not MODEL_LIMITS_PATH.exists():
++        return limits
++    try:
++        import yaml as _yaml
++        raw_text = MODEL_LIMITS_PATH.read_text(encoding="utf-8")
++        raw = _yaml.safe_load(_extract_yaml_block(raw_text)) or {}
++        configured = raw.get("limits") if isinstance(raw.get("limits"), dict) else {}
++        for model, cfg in configured.items():
++            if isinstance(cfg, dict):
++                limits[str(model)] = {
++                    "context": int(cfg.get("context") or limits.get(str(model), {}).get("context") or 0),
++                    "output": int(cfg.get("output") or limits.get(str(model), {}).get("output") or 0),
++                }
++    except Exception as e:
++        log.warning(f"model limits read failed: {e}")
++    return limits
++
++
++def _context_limit_for(model: str, agent: str) -> int:
++    limits = _model_limits()
++    if model in limits:
++        return int(limits[model].get("context") or 0)
++    current = _read_env_model(agent)
++    if current in limits:
++        return int(limits[current].get("context") or 0)
++    fallback_model = (AGENT_MODELS.get(agent) or [""])[0]
++    return int(limits.get(fallback_model, {}).get("context") or 0)
++
++
++def _safe_session_id(path: Path) -> str:
++    stem = path.name[:-6] if path.name.endswith(".jsonl") else path.stem
++    return re.sub(r"[^A-Za-z0-9_.-]+", "-", stem)[:160]
++
++
++def _inspector_files(agent: str) -> list[Path]:
++    root = INSPECTOR_ROOTS.get(agent)
++    if not root or not root.exists():
++        return []
++    if agent == "gemini":
++        files = list(root.glob("**/chats/*.jsonl")) + list(root.glob("**/chats/*.json"))
++    else:
++        files = list(root.glob("**/*.jsonl"))
++    files = [p for p in files if p.is_file()]
++    files.sort(key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True)
++    return files[:40]
++
++
++def _inspector_session_record(agent: str, path: Path) -> dict:
++    stat = path.stat()
++    return {
++        "id": _safe_session_id(path),
++        "agent": agent,
++        "path": str(path),
++        "name": path.name,
++        "mtime": stat.st_mtime,
++        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
++        "size": stat.st_size,
++    }
++
++
++def _find_inspector_session(agent: str, session_id: str) -> Path | None:
++    for path in _inspector_files(agent):
++        if _safe_session_id(path) == session_id:
++            return path
++    return None
++
++
++def _event_from_obj(agent: str, session_id: str, obj: dict, idx: int) -> dict | None:
++    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
++    message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
++    role = message.get("role") or obj.get("role") or payload.get("role") or obj.get("type") or payload.get("type") or "event"
++    model = message.get("model") or obj.get("model") or payload.get("model") or ""
++    ts = obj.get("timestamp") or payload.get("timestamp") or (obj.get("$set") or {}).get("lastUpdated") or ""
++
++    body = ""
++    if message:
++        body = _content_to_text(message.get("content"))
++        if not body:
++            body = f"[{role} metadata-only event]"
++    if not body and payload:
++        body = _content_to_text(payload.get("content") or payload.get("text") or payload.get("arguments"))
++    if not body and obj.get("content") is not None:
++        body = _content_to_text(obj.get("content"))
++    if not body and obj.get("lastPrompt"):
++        body = str(obj.get("lastPrompt"))
++    if not body and obj.get("thoughts"):
++        body = _content_to_text(obj.get("thoughts"))
++    if not body:
++        body = str(obj)
++
++    # CLI telemetry often stores cumulative API usage on each event. The
++    # inspector needs per-row body pressure, so estimate from rendered body.
++    tokens = _estimate_tokens(body)
++    summary = " ".join(body.split())[:180]
++    return {
++        "id": f"{session_id}:{idx}",
++        "agent": agent,
++        "session_id": session_id,
++        "index": idx,
++        "ts": ts,
++        "role": str(role),
++        "model": str(model),
++        "tokens": tokens,
++        "summary": summary,
++        "body": body,
++    }
++
++
++def _read_context_events(agent: str, session_id: str, start: int | None = None, end: int | None = None) -> dict:
++    path = _find_inspector_session(agent, session_id)
++    if not path:
++        return {"error": "session not found", "events": []}
++    import json as _json
++    text = path.read_text(encoding="utf-8", errors="replace")
++    if text and not text.endswith("\n"):
++        text = text.rsplit("\n", 1)[0]
++    events = []
++    for idx, line in enumerate(text.splitlines()):
++        if not line.strip():
++            continue
++        try:
++            obj = _json.loads(line)
++        except Exception:
++            continue
++        ev = _event_from_obj(agent, session_id, obj, idx)
++        if ev:
++            events.append(ev)
++    total_events = len(events)
++    running = 0
++    model = ""
++    for ev in events:
++        running += ev.get("tokens") or 0
++        ev["running_tokens"] = running
++        if ev.get("model"):
++            model = ev["model"]
++    total_tokens = running
++    if start is None and end is None:
++        events = events[-500:]
++    else:
++        events = events[max(0, start or 0): end if end is not None else None]
++    context_limit = _context_limit_for(model, agent)
++    pct = (total_tokens / context_limit * 100) if context_limit else 0
++    return {
++        "agent": agent,
++        "session": _inspector_session_record(agent, path),
++        "events": events,
++        "total_events": total_events,
++        "total_tokens": total_tokens,
++        "model": model or _read_env_model(agent),
++        "context_limit": context_limit,
++        "context_pct": pct,
++    }
++
++
++@app.get("/api/inspector/{agent}/sessions")
++async def inspector_sessions(agent: str):
++    agent = agent.strip().lower()
++    if agent not in INSPECTOR_ROOTS:
++        return {"error": f"unknown agent: {agent}", "sessions": []}
++    return {"agent": agent, "sessions": [_inspector_session_record(agent, p) for p in _inspector_files(agent)]}
++
++
++@app.get("/api/inspector/{agent}/sessions/{session_id}/events")
++async def inspector_session_events(
++    agent: str,
++    session_id: str,
++    from_: int | None = Query(default=None, alias="from"),
++    to: int | None = None,
++):
++    return _read_context_events(agent.strip().lower(), session_id, from_, to)
++
++
++@app.websocket("/ws/inspector")
++async def ws_inspector(client_ws: WebSocket):
++    await client_ws.accept()
++    _INSPECTOR_WS_CLIENTS.add(client_ws)
++    try:
++        while True:
++            await client_ws.receive_text()
++    except WebSocketDisconnect:
++        pass
++    except Exception:
++        pass
++    finally:
++        _INSPECTOR_WS_CLIENTS.discard(client_ws)
++
++
++async def _broadcast_inspector_update(agent: str, session_id: str):
++    import json as _json
++    payload = _json.dumps({"type": "inspector.update", "agent": agent, "session_id": session_id})
++    dead = []
++    for ws in list(_INSPECTOR_WS_CLIENTS):
++        try:
++            await ws.send_text(payload)
++        except Exception:
++            dead.append(ws)
++    for ws in dead:
++        _INSPECTOR_WS_CLIENTS.discard(ws)
++
++
++async def _inspector_tail_loop():
++    await asyncio.sleep(5)
++    while True:
++        try:
++            for agent in INSPECTOR_ROOTS:
++                for path in _inspector_files(agent)[:8]:
++                    key = f"{agent}:{path}"
++                    mtime = path.stat().st_mtime_ns
++                    if key not in _INSPECTOR_MTIME_SNAPSHOT:
++                        _INSPECTOR_MTIME_SNAPSHOT[key] = mtime
++                    elif _INSPECTOR_MTIME_SNAPSHOT[key] != mtime:
++                        _INSPECTOR_MTIME_SNAPSHOT[key] = mtime
++                        await _broadcast_inspector_update(agent, _safe_session_id(path))
++        except Exception as e:
++            log.warning(f"inspector tail tick failed: {e}")
++        await asyncio.sleep(5)
++
++
++@app.on_event("startup")
++async def _start_inspector_tail_loop():
++    asyncio.create_task(_inspector_tail_loop())
++
++
+ # ── Static file serving (mounted LAST so explicit routes win) ───────────────
+ 
+ # Dev: disable cache for JSX/JS/CSS so Babel-in-browser always picks up edits.
+@@ -3423,6 +3731,332 @@ def _write_env_model(slug: str, model: str):
+     f.write_text("\n".join(lines) + "\n")
+ 
+ 
++SECRET_KEY_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PRIVATE", "CREDENTIAL", "AUTH")
++SECRET_KEY_EXACT = {
++    "OPENAI_API_KEY",
++    "ANTHROPIC_API_KEY",
++    "GEMINI_API_KEY",
++    "GOOGLE_API_KEY",
++    "OPENROUTER_API_KEY",
++}
++
++
++def _is_secret_env_key(key: str) -> bool:
++    normalized = (key or "").strip().upper()
++    return normalized in SECRET_KEY_EXACT or any(marker in normalized for marker in SECRET_KEY_MARKERS)
++
++
++def _agent_settings_defaults() -> dict:
++    agents = {}
++    for slug, options in AGENT_MODELS.items():
++        agents[slug] = {
++            "enabled": True,
++            "model": _read_env_model(slug) or (options[0] if options else ""),
++        }
++    for slug, _color, model_hint, _cmd, _vault_ok in _KNOWN_AGENTS:
++        agents.setdefault(slug, {"enabled": True, "model": model_hint})
++    return {"env": {}, "agents": agents}
++
++
++def _load_agent_settings_config() -> dict:
++    defaults = _agent_settings_defaults()
++    if not AGENT_CONFIG_PATH.exists():
++        return defaults
++    try:
++        import yaml as _yaml
++        text = AGENT_CONFIG_PATH.read_text(encoding="utf-8")
++        if text.startswith("---\n"):
++            end = text.find("\n---\n", 4)
++            if end != -1:
++                text = text[end + 5:]
++        raw = _yaml.safe_load(text) or {}
++    except Exception as e:
++        log.warning(f"settings config read failed: {e}")
++        raw = {}
++    env = raw.get("env") if isinstance(raw.get("env"), dict) else {}
++    agents_raw = raw.get("agents") if isinstance(raw.get("agents"), dict) else {}
++    agents = defaults["agents"]
++    for slug, cfg in agents_raw.items():
++        if not isinstance(cfg, dict):
++            continue
++        current = agents.setdefault(slug, {"enabled": True, "model": ""})
++        if "enabled" in cfg:
++            current["enabled"] = bool(cfg.get("enabled"))
++        if cfg.get("model") is not None:
++            current["model"] = str(cfg.get("model") or "")
++    return {"env": {str(k): str(v) for k, v in env.items()}, "agents": agents}
++
++
++def _agent_enabled(slug: str) -> bool:
++    return bool((_load_agent_settings_config().get("agents") or {}).get(slug, {}).get("enabled", True))
++
++
++def _disabled_agents_in_text(text: str) -> list[str]:
++    mentions = {m.group(1).lower() for m in re.finditer(r"@([A-Za-z][A-Za-z0-9_-]*)", text or "")}
++    return sorted(slug for slug in mentions if slug in _KNOWN_AGENT_SLUGS and not _agent_enabled(slug))
++
++
++def _settings_system_env() -> list[dict]:
++    import os as _os
++    keys = {
++        "AGENTOS_PORT",
++        "AGENTOS_HOST",
++        "AGENTCHATTR_PORT",
++        "OPENAI_API_KEY",
++        "ANTHROPIC_API_KEY",
++        "GEMINI_API_KEY",
++        "GOOGLE_API_KEY",
++        "OPENROUTER_API_KEY",
++    }
++    keys.update(k for k in _os.environ if k.startswith("AGENTOS_"))
++    rows = []
++    for key in sorted(keys):
++        value = _os.environ.get(key, "")
++        secret = _is_secret_env_key(key)
++        rows.append({
++            "key": key,
++            "value": "••••••••" if secret and value else value,
++            "set": bool(value),
++            "secret": secret,
++            "source": "process",
++            "read_only": True,
++        })
++    return rows
++
++
++def _settings_proposal_filename() -> str:
++    import datetime as _dt
++    stamp = _dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
++    target_slug = AGENT_CONFIG_REL.replace("/", "__")
++    return f"{stamp}_{target_slug}.md"
++
++
++def _write_agent_settings_proposal(config: dict, rationale: str) -> dict:
++    import datetime as _dt
++    import yaml as _yaml
++    outgoing = VAULT / "00-Inbox" / "Outgoing"
++    outgoing.mkdir(parents=True, exist_ok=True)
++    proposed_at = _dt.datetime.now().isoformat(timespec="seconds")
++    fm = {
++        "type": "proposal",
++        "target_path": AGENT_CONFIG_REL,
++        "operation": "replace",
++        "agent_id": "codex",
++        "rationale": rationale,
++        "proposed_at": proposed_at,
++        "task_id": 36,
++    }
++    body = _yaml.safe_dump(config, sort_keys=False, allow_unicode=True).strip() + "\n"
++    text = "---\n" + _yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip() + "\n---\n" + body
++    target = outgoing / _settings_proposal_filename()
++    target.write_text(text, encoding="utf-8")
++    return {
++        "id": target.stem,
++        "path": str(target.relative_to(VAULT)),
++        "target_path": AGENT_CONFIG_REL,
++        "proposed_at": proposed_at,
++    }
++
++
++def _settings_payload(config: dict | None = None) -> dict:
++    config = config or _load_agent_settings_config()
++    agent_rows = []
++    for slug, cfg in sorted((config.get("agents") or {}).items()):
++        agent_rows.append({
++            "slug": slug,
++            "enabled": bool(cfg.get("enabled", True)),
++            "model": cfg.get("model") or "",
++            "options": AGENT_MODELS.get(slug, []),
++            "known": slug in _KNOWN_AGENT_SLUGS,
++        })
++    env_rows = []
++    for key, value in sorted((config.get("env") or {}).items()):
++        secret = _is_secret_env_key(key)
++        env_rows.append({
++            "key": key,
++            "value": "••••••••" if secret and value else value,
++            "set": bool(value),
++            "secret": secret,
++            "source": "config",
++            "read_only": False,
++        })
++    return {
++        "env": env_rows,
++        "agents": agent_rows,
++        "system_env": _settings_system_env(),
++        "models": AGENT_MODELS,
++        "meta": {
++            "config_path": AGENT_CONFIG_REL,
++            "exists": AGENT_CONFIG_PATH.exists(),
++            "secret_markers": list(SECRET_KEY_MARKERS),
++        },
++    }
++
++
++@app.get("/api/settings")
++async def settings_get():
++    return _settings_payload()
++
++
++@app.post("/api/settings/env")
++async def settings_env_put(payload: dict):
++    key = (payload.get("key") or "").strip().upper()
++    value = str(payload.get("value") or "")
++    if not re.match(r"^[A-Z_][A-Z0-9_]*$", key):
++        return {"error": "env key must match ^[A-Z_][A-Z0-9_]*$"}
++    if _is_secret_env_key(key):
++        return {"error": f"{key} looks like a secret; store it in the process environment, not agent-config.yaml"}
++    config = _load_agent_settings_config()
++    config.setdefault("env", {})[key] = value
++    proposal = _write_agent_settings_proposal(config, f"Update runtime env setting {key} from Settings UI")
++    return {"ok": True, "proposal": proposal, "settings": _settings_payload(config)}
++
++
++@app.post("/api/settings/agent")
++async def settings_agent_put(payload: dict):
++    slug = (payload.get("slug") or "").strip().lower()
++    if slug not in _KNOWN_AGENT_SLUGS:
++        return {"error": f"unknown agent slug: {slug}"}
++    config = _load_agent_settings_config()
++    agents = config.setdefault("agents", {})
++    current = dict(agents.get(slug) or {"enabled": True, "model": _read_env_model(slug)})
++    if "enabled" in payload:
++        current["enabled"] = bool(payload.get("enabled"))
++    if "model" in payload:
++        model = str(payload.get("model") or "").strip()
++        if not model:
++            return {"error": "model required"}
++        current["model"] = model
++    agents[slug] = current
++    proposal = _write_agent_settings_proposal(config, f"Update {slug} agent settings from Settings UI")
++    return {"ok": True, "proposal": proposal, "settings": _settings_payload(config)}
++
++
++def _default_allowlist(slug: str) -> dict:
++    if agent_permissions:
++        return agent_permissions.default_allowlist(slug)
++    return {"tools": ["Read"], "paths": {"read": ["/Users/zeroclaw/**"], "write": []}, "bash": [], "deny": {"bash": []}}
++
++
++def _normalize_allowlist(slug: str, raw: dict | None) -> dict:
++    if agent_permissions:
++        return agent_permissions.merge_with_default(slug, raw)
++    return raw or _default_allowlist(slug)
++
++
++def _translate_allowlist(slug: str, allowlist: dict) -> dict:
++    if agent_permissions:
++        return agent_permissions.translate_for_cli(slug, allowlist)
++    return {"cli": slug, "config": allowlist}
++
++
++def _record_security_event(kind: str, summary: str, extra: dict | None = None):
++    import datetime as _dt
++    import json as _json
++    event = {
++        "kind": kind,
++        "project": "agentos-roadmap",
++        "task_id": 38,
++        "phase": "Build",
++        "agent": (extra or {}).get("agent"),
++        "ts": _dt.datetime.now().isoformat(timespec="seconds"),
++        "summary": summary,
++    }
++    if extra:
++        event.update(extra)
++    try:
++        PHASE_EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
++        with PHASE_EVENTS_LOG.open("a", encoding="utf-8") as f:
++            f.write(_json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
++    except Exception as e:
++        log.warning(f"security event log failed: {e}")
++
++
++def _agent_allowlist_from_config(slug: str, config: dict | None = None) -> dict:
++    config = config or _load_agent_settings_config()
++    raw = ((config.get("agents") or {}).get(slug) or {}).get("allowlist")
++    return _normalize_allowlist(slug, raw)
++
++
++@app.get("/api/agents/{slug}/allowlist")
++async def agent_allowlist_get(slug: str):
++    slug = slug.strip().lower()
++    if slug not in _KNOWN_AGENT_SLUGS:
++        return {"error": f"unknown agent slug: {slug}"}
++    allowlist = _agent_allowlist_from_config(slug)
++    return {
++        "agent": slug,
++        "allowlist": allowlist,
++        "known_tools": getattr(agent_permissions, "KNOWN_TOOLS", ["Read", "Edit", "Write", "Bash"]) if agent_permissions else ["Read", "Edit", "Write", "Bash"],
++        "translation": _translate_allowlist(slug, allowlist),
++        "requires_restart": True,
++    }
++
++
++@app.post("/api/agents/{slug}/allowlist")
++async def agent_allowlist_put(slug: str, payload: dict):
++    slug = slug.strip().lower()
++    if slug not in _KNOWN_AGENT_SLUGS:
++        return {"error": f"unknown agent slug: {slug}"}
++    allowlist = _normalize_allowlist(slug, payload.get("allowlist") or {})
++    if not allowlist.get("tools"):
++        return {"error": "allowlist must include at least one tool"}
++    if slug in ("codex", "claude") and "Read" not in allowlist.get("tools", []):
++        return {"error": "minimum allowlist must include Read"}
++    config = _load_agent_settings_config()
++    agents = config.setdefault("agents", {})
++    current = dict(agents.get(slug) or {"enabled": True, "model": _read_env_model(slug)})
++    before = current.get("allowlist")
++    current["allowlist"] = allowlist
++    agents[slug] = current
++    proposal = _write_agent_settings_proposal(config, f"Update {slug} tool permission allowlist from AgentOS")
++    _record_security_event("allowlist-changed", f"allowlist changed for @{slug}", {
++        "agent": slug,
++        "field": "allowlist",
++        "before": before,
++        "after": allowlist,
++        "changed_by": payload.get("changed_by") or "user",
++        "proposal": proposal.get("path"),
++    })
++    return {
++        "ok": True,
++        "proposal": proposal,
++        "agent": slug,
++        "allowlist": allowlist,
++        "translation": _translate_allowlist(slug, allowlist),
++        "requires_restart": True,
++    }
++
++
++@app.post("/api/permissions/check")
++async def permissions_check(payload: dict):
++    slug = (payload.get("agent") or "").strip().lower()
++    tool = (payload.get("tool") or "").strip()
++    command = (payload.get("command") or "").strip()
++    if slug not in _KNOWN_AGENT_SLUGS:
++        return {"error": f"unknown agent slug: {slug}"}
++    allowlist = _agent_allowlist_from_config(slug)
++    if tool == "Bash" and command and agent_permissions:
++        result = agent_permissions.check_bash(allowlist, command)
++    elif agent_permissions:
++        result = agent_permissions.check_tool(allowlist, tool)
++    else:
++        result = type("R", (), {"allowed": True, "reason": "permissions module unavailable", "matched": "", "kind": "allow"})()
++    if not result.allowed:
++        _record_security_event("tool-call-denied", f"denied {tool or 'tool'} for @{slug}: {result.reason}", {
++            "agent": slug,
++            "tool": tool,
++            "args_summary": command[:160],
++            "reason": result.reason,
++        })
++    return {
++        "allowed": bool(result.allowed),
++        "reason": result.reason,
++        "matched": result.matched,
++        "kind": result.kind,
++    }
++
++
+ @app.get("/api/agents/models")
+ async def agents_models_list():
+     """Available models per agent slug (for dropdown). Includes the
+@@ -3668,7 +4302,8 @@ async def ws_vault_changes(client_ws: WebSocket):
+ async def _broadcast_vault_change(rel_path: str, event_type: str):
+     """Notify all connected clients that a vault file changed."""
+     import json as _j
+-    payload = _j.dumps({"type": "vault_change", "path": rel_path, "change": event_type})
++    event_name = "settings.update" if rel_path == AGENT_CONFIG_REL else "vault_change"
++    payload = _j.dumps({"type": event_name, "path": rel_path, "change": event_type})
+     dead = []
+     for ws in list(_VAULT_WATCH_CLIENTS):
+         try:
+@@ -3683,7 +4318,7 @@ async def _broadcast_vault_change(rel_path: str, event_type: str):
+ async def _start_vault_watcher():
+     import asyncio
+     try:
+-        from watchdog.observers import Observer
++        from watchdog.observers.polling import PollingObserver as Observer
+         from watchdog.events import FileSystemEventHandler
+     except ImportError:
+         log.warning("vault watcher: watchdog not installed, skipping")
+@@ -3698,20 +4333,21 @@ async def _start_vault_watcher():
+             if event.is_directory:
+                 return
+             src = event.src_path
+-            if not src.endswith(".md"):
++            try:
++                rel_path = Path(src).relative_to(VAULT)
++            except Exception:
++                return
++            rel = str(rel_path)
++            if not src.endswith(".md") and rel != AGENT_CONFIG_REL:
+                 return
+             # skip hidden / .obsidian / .claude
+-            if any(p.startswith(".") for p in Path(src).relative_to(VAULT).parts):
++            if any(p.startswith(".") for p in rel_path.parts):
+                 return
+             import time as _t
+             now = _t.time()
+             if now - self._last_event.get(src, 0) < 0.5:
+                 return  # debounce 500ms
+             self._last_event[src] = now
+-            try:
+-                rel = str(Path(src).relative_to(VAULT))
+-            except Exception:
+-                return
+             asyncio.run_coroutine_threadsafe(
+                 _broadcast_vault_change(rel, event.event_type), loop
+             )
+@@ -3719,7 +4355,8 @@ async def _start_vault_watcher():
+     obs = Observer()
+     handler = _Handler()
+     # Watch relevant subtrees only (avoid .git noise)
+-    for sub in ("02-Areas/AI-Automation/Lab", "04-Wiki", "07-Meta", "agentos",
++    for sub in ("02-Areas/AI-Automation/Lab", "02-Areas/AI-Automation/AgentOS/runtime",
++                "04-Wiki", "07-Meta", "agentos",
+                 "00-Inbox/Outgoing", "00-Inbox/Generated", "01-Projects"):
+         target = VAULT / sub
+         if target.exists():
+@@ -3990,9 +4627,34 @@ async def _auto_approve_loop():
+             prompts = await agents_permission_prompts()
+             for p in prompts:
+                 excerpt_lower = p["excerpt"].lower()
++                if agent_permissions and "rm " in excerpt_lower:
++                    result = agent_permissions.check_bash(_agent_allowlist_from_config(p["agent"]), "rm *")
++                    if not result.allowed:
++                        _record_security_event("tool-call-denied", f"denied Bash for @{p['agent']}: {result.reason}", {
++                            "agent": p["agent"],
++                            "tool": "Bash",
++                            "args_summary": "rm *",
++                            "reason": result.reason,
++                            "session": p["session"],
++                        })
++                        continue
+                 # match any whitelisted tool name
+-                if not any(tg in excerpt_lower for tg in _AUTO_APPROVE_TOOL_GLOBS):
++                matched_glob = next((tg for tg in _AUTO_APPROVE_TOOL_GLOBS if tg in excerpt_lower), "")
++                if not matched_glob:
+                     continue
++                if agent_permissions:
++                    check_name = "mcp__vault__propose_change" if matched_glob in ("vault.", "vault_", "propose_change") else \
++                                 "mcp__agentchattr__chat_send" if matched_glob.startswith("chat_") or "agentchattr" in matched_glob else matched_glob
++                    check = agent_permissions.check_tool(_agent_allowlist_from_config(p["agent"]), check_name)
++                    if not check.allowed:
++                        _record_security_event("tool-call-denied", f"denied {check_name} for @{p['agent']}: {check.reason}", {
++                            "agent": p["agent"],
++                            "tool": check_name,
++                            "args_summary": p["excerpt"][-160:],
++                            "reason": check.reason,
++                            "session": p["session"],
++                        })
++                        continue
+                 excerpt_hash = hashlib.md5(p["excerpt"].encode()).hexdigest()
+                 if _LAST_AUTO_APPROVED.get(p["session"]) == excerpt_hash:
+                     continue  # already approved this exact prompt
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index 38de6ae..d46e1c7 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -669,6 +669,86 @@ html[data-theme="dark"] .tag-think { background: rgba(255,255,255,0.06); }
+ .trace-bar { height: 100%; background: var(--accent); opacity: 0.6; }
+ .trace-t { font-size: 10.5px; color: var(--ink-3); text-align: right; }
+ 
++/* Context inspector */
++.context-inspector {
++  border: 1px solid var(--line);
++  border-radius: 8px;
++  overflow: hidden;
++  background: var(--bg);
++}
++.context-toolbar {
++  display: flex;
++  justify-content: space-between;
++  align-items: flex-end;
++  gap: 16px;
++  padding: 12px;
++  border-bottom: 1px solid var(--line);
++  background: var(--bg-sunken);
++}
++.context-controls { display: flex; align-items: center; gap: 10px; }
++.context-controls .inp { min-width: 260px; max-width: 360px; }
++.context-hide { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ink-2); }
++.context-tokenbar {
++  height: 8px;
++  background: var(--muted-line);
++  overflow: hidden;
++}
++.context-tokenbar-fill { height: 100%; background: var(--accent); }
++.context-tokenbar.warn .context-tokenbar-fill { background: var(--warn); }
++.context-tokenbar.danger .context-tokenbar-fill { background: var(--err); }
++.context-token-meta {
++  display: flex;
++  justify-content: space-between;
++  gap: 16px;
++  padding: 8px 12px;
++  border-bottom: 1px solid var(--line);
++  color: var(--ink-3);
++  font-size: 11px;
++}
++.context-events { max-height: calc(100vh - 330px); overflow-y: auto; }
++.context-event { border-bottom: 1px solid var(--line); }
++.context-event:last-child { border-bottom: 0; }
++.context-event-row {
++  width: 100%;
++  display: grid;
++  grid-template-columns: 54px 92px minmax(160px, 0.8fr) 76px minmax(220px, 1.6fr);
++  gap: 10px;
++  align-items: baseline;
++  padding: 8px 12px;
++  border: 0;
++  background: transparent;
++  color: var(--ink);
++  text-align: left;
++  cursor: pointer;
++}
++.context-event-row:hover { background: var(--bg-sunken); }
++.context-idx, .context-ts, .context-tokens { color: var(--ink-3); font-size: 10.5px; }
++.context-summary {
++  color: var(--ink-2);
++  font-size: 12px;
++  overflow: hidden;
++  white-space: nowrap;
++  text-overflow: ellipsis;
++}
++.context-body {
++  margin: 0;
++  padding: 12px 16px 14px 170px;
++  border-top: 1px solid var(--line);
++  background: #010409;
++  color: #e8e6e2;
++  white-space: pre-wrap;
++  word-break: break-word;
++  max-height: 360px;
++  overflow: auto;
++  font-size: 12px;
++  line-height: 1.55;
++}
++.context-empty {
++  padding: 18px;
++  color: var(--ink-3);
++  font-size: 12px;
++}
++
+ /* Tools pane */
+ .tools-pane { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+ .tool-card { border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+@@ -1228,6 +1308,23 @@ input[type="range"]::-moz-range-thumb {
+ .perm-on.perm-read   { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+ .perm-on.perm-write  { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+ .perm-on.perm-delete { background: var(--err-soft); color: var(--err); border-color: transparent; }
++.allowlist-editor { display: flex; flex-direction: column; gap: 14px; }
++.allowlist-footer {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  padding: 10px 12px;
++  border: 1px solid var(--line);
++  border-radius: 6px;
++  background: var(--bg-sunken);
++}
++.allowlist-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
++.allowlist-known {
++  color: var(--ink-3);
++  font-size: 10.5px;
++  line-height: 1.5;
++}
+ .row-x {
+   width: 22px; height: 22px;
+   border-radius: 4px; border: 0;
+@@ -2021,6 +2118,51 @@ html[data-theme="dark"] .links-add-btn.on { color: #0a0b0d; }
+   color: var(--ink-3); font-family: var(--mono);
+ }
+ .settings-card-body { padding: 14px; }
++.settings-alert {
++  margin-bottom: 14px;
++  border: 1px solid var(--line);
++  border-radius: 6px;
++  padding: 9px 12px;
++  font-size: 11px;
++}
++.settings-alert-error { border-color: var(--err); color: var(--err); background: color-mix(in srgb, var(--err) 8%, transparent); }
++.settings-alert-ok { border-color: var(--ok); color: var(--ok); background: color-mix(in srgb, var(--ok) 8%, transparent); }
++.settings-table { display: flex; flex-direction: column; }
++.settings-row {
++  display: grid;
++  grid-template-columns: minmax(160px, 0.8fr) minmax(220px, 1fr) 96px;
++  gap: 12px;
++  align-items: center;
++  padding: 10px 12px;
++  border-bottom: 1px solid var(--line);
++  font-size: 13px;
++}
++.settings-row:last-child { border-bottom: 0; }
++.settings-head {
++  background: var(--bg-sunken);
++  color: var(--ink-3);
++  font-size: 10px;
++  text-transform: uppercase;
++  letter-spacing: 0.08em;
++  padding: 8px 12px;
++}
++.settings-add-row { background: var(--bg-sunken); }
++.agent-settings-list { display: flex; flex-direction: column; }
++.agent-settings-row {
++  display: grid;
++  grid-template-columns: minmax(110px, 1fr) 48px minmax(220px, 1fr) 84px;
++  gap: 12px;
++  align-items: center;
++  padding: 12px;
++  border-bottom: 1px solid var(--line);
++}
++.agent-settings-row:last-child { border-bottom: 0; }
++.agent-name { font-size: 13px; font-weight: 600; }
++button.toggle-switch {
++  border: 0;
++  padding: 0;
++  cursor: pointer;
++}
+ 
+ .toggle-row {
+   display: flex; justify-content: space-between; align-items: center;
+diff --git a/ui-static/screens/agent-edit.jsx b/ui-static/screens/agent-edit.jsx
+index 87bb8b9..9705941 100644
+--- a/ui-static/screens/agent-edit.jsx
++++ b/ui-static/screens/agent-edit.jsx
+@@ -237,6 +237,12 @@ function AgentEditPane({ agent }) {
+                      onChange={(tt) => update("toolsDetailed", tt)} />
+       </Section>
+ 
++      <Section title="Permission allowlist"
++               hint="Least-privilege tools, write paths, and bash patterns. Changes queue a HITL config proposal."
++               count={agent.name}>
++        <AllowlistEditor agentSlug={agent.name} />
++      </Section>
++
+       {/* Memory */}
+       <Section title="Memory layers"
+                hint="Which of the 5 system memory layers this agent reads from. Manage the layers themselves in Memory."
+@@ -427,6 +433,130 @@ function ToolsEditor({ tools, onChange }) {
+   );
+ }
+ 
++function AllowlistEditor({ agentSlug }) {
++  const [state, setState] = React.useState(null);
++  const [draft, setDraft] = React.useState(null);
++  const [msg, setMsg] = React.useState("");
++  const [saving, setSaving] = React.useState(false);
++
++  const load = React.useCallback(() => {
++    fetch(`/api/agents/${encodeURIComponent(agentSlug)}/allowlist`)
++      .then(r => r.json())
++      .then(d => {
++        setState(d);
++        setDraft(d.allowlist || null);
++        setMsg(d.error || "");
++      })
++      .catch(e => setMsg(String(e).slice(0, 120)));
++  }, [agentSlug]);
++
++  React.useEffect(load, [load]);
++
++  const setList = (key, value) => {
++    setDraft({ ...draft, [key]: value.split("\n").map(s => s.trim()).filter(Boolean) });
++  };
++  const setPathList = (kind, value) => {
++    setDraft({
++      ...draft,
++      paths: {
++        ...(draft.paths || {}),
++        [kind]: value.split("\n").map(s => s.trim()).filter(Boolean),
++      },
++    });
++  };
++  const setDenyBash = (value) => {
++    setDraft({
++      ...draft,
++      deny: { ...(draft.deny || {}), bash: value.split("\n").map(s => s.trim()).filter(Boolean) },
++    });
++  };
++  const save = async () => {
++    setSaving(true); setMsg("");
++    try {
++      const r = await fetch(`/api/agents/${encodeURIComponent(agentSlug)}/allowlist`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ allowlist: draft, changed_by: "agent-edit" }),
++      });
++      const d = await r.json();
++      if (d.error) setMsg(d.error);
++      else {
++        setState(d);
++        setDraft(d.allowlist);
++        setMsg(`proposal queued · ${d.proposal?.path || ""}`);
++      }
++    } catch (e) {
++      setMsg(String(e).slice(0, 120));
++    }
++    setSaving(false);
++  };
++  const restart = async () => {
++    setSaving(true); setMsg("");
++    try {
++      const r = await fetch(`/api/agents/${encodeURIComponent(agentSlug)}/restart`, { method: "POST" });
++      const d = await r.json();
++      setMsg(d.error ? d.error : `restart requested · pid ${d.new_pid || "pending"}`);
++    } catch (e) {
++      setMsg(String(e).slice(0, 120));
++    }
++    setSaving(false);
++  };
++
++  if (!draft) return <div className="muted mono">loading allowlist…</div>;
++
++  return (
++    <div className="allowlist-editor">
++      <div className="field-row">
++        <Field label="Tools" hint="one per line; globs allowed">
++          <textarea className="inp inp-area mono" rows={6}
++            value={(draft.tools || []).join("\n")}
++            onChange={(e) => setList("tools", e.target.value)} />
++        </Field>
++        <Field label="Bash allow" hint="gitignore-style command patterns">
++          <textarea className="inp inp-area mono" rows={6}
++            value={(draft.bash || []).join("\n")}
++            onChange={(e) => setList("bash", e.target.value)} />
++        </Field>
++        <Field label="Bash deny" hint="checked before allow">
++          <textarea className="inp inp-area mono" rows={6}
++            value={((draft.deny || {}).bash || []).join("\n")}
++            onChange={(e) => setDenyBash(e.target.value)} />
++        </Field>
++      </div>
++      <div className="field-row">
++        <Field label="Read paths">
++          <textarea className="inp inp-area mono" rows={4}
++            value={((draft.paths || {}).read || []).join("\n")}
++            onChange={(e) => setPathList("read", e.target.value)} />
++        </Field>
++        <Field label="Write paths">
++          <textarea className="inp inp-area mono" rows={4}
++            value={((draft.paths || {}).write || []).join("\n")}
++            onChange={(e) => setPathList("write", e.target.value)} />
++        </Field>
++      </div>
++      <div className="allowlist-footer">
++        <div className="mono muted">
++          {state?.translation?.cli || agentSlug} · restart required after approval
++          {msg && <span> · {msg}</span>}
++        </div>
++        <div className="allowlist-actions">
++          <button className="btn btn-ghost" onClick={load} disabled={saving}>reset</button>
++          <button className="btn btn-ghost" onClick={restart} disabled={saving}>restart agent</button>
++          <button className="btn btn-primary" onClick={save} disabled={saving}>
++            {saving ? "working…" : "queue allowlist"}
++          </button>
++        </div>
++      </div>
++      {state?.known_tools && (
++        <div className="allowlist-known mono">
++          known: {state.known_tools.join(" · ")}
++        </div>
++      )}
++    </div>
++  );
++}
++
+ // ── Tag editor ───────────────────────────────────────────────────────────
+ function TagEditor({ tags, onChange, placeholder = "add tag…", pill }) {
+   const [v, setV] = useState("");
+diff --git a/permissions.py b/permissions.py
+new file mode 100644
+index 0000000..99193c4
+--- /dev/null
++++ b/permissions.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++"""AgentOS per-agent permission allowlist helpers.
++
++The vault schema is intentionally CLI-neutral. This module keeps the small
++translation layer that launch wrappers and serve.py can both call.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import json
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++try:
++    import yaml
++except Exception:  # pragma: no cover
++    yaml = None
++
++
++DEFAULT_ALLOWLISTS: dict[str, dict[str, Any]] = {
++    "claude": {
++        "tools": ["Read", "Edit", "Write", "Bash", "mcp__vault__*", "mcp__agentchattr__*"],
++        "paths": {
++            "read": ["/Users/zeroclaw/**"],
++            "write": ["/Users/zeroclaw/Documents/**", "/Users/zeroclaw/Documents/obsidian/LosAgentOS/**"],
++        },
++        "bash": ["git *", "ls *", "rg *", "fd *"],
++        "deny": {"bash": ["rm *", "sudo *"]},
++    },
++    "codex": {
++        "tools": ["Read", "Edit", "Write", "Bash", "mcp__vault__*", "mcp__agentchattr__*"],
++        "paths": {
++            "read": ["/Users/zeroclaw/**"],
++            "write": ["/Users/zeroclaw/Documents/**", "/Users/zeroclaw/agentos/**"],
++        },
++        "bash": ["git *", "ls *", "rg *", "sed *", "python *", ".venv/bin/python *"],
++        "deny": {"bash": ["rm *", "sudo *"]},
++    },
++    "gemini": {
++        "tools": ["Read", "Bash", "mcp__vault__*", "mcp__agentchattr__*"],
++        "paths": {
++            "read": ["/Users/zeroclaw/**"],
++            "write": ["/Users/zeroclaw/Documents/obsidian/LosAgentOS/**"],
++        },
++        "bash": ["git *", "ls *", "rg *"],
++        "deny": {"bash": ["rm *", "sudo *"]},
++    },
++}
++
++
++KNOWN_TOOLS = [
++    "Read",
++    "Edit",
++    "Write",
++    "Bash",
++    "WebFetch",
++    "WebSearch",
++    "mcp__vault__*",
++    "mcp__agentchattr__*",
++    "mcp__codex_apps__*",
++]
++
++
++@dataclass
++class PermissionCheck:
++    allowed: bool
++    reason: str
++    matched: str = ""
++    kind: str = "allow"
++
++
++def default_allowlist(agent: str) -> dict[str, Any]:
++    return normalize_allowlist(DEFAULT_ALLOWLISTS.get(agent, {
++        "tools": ["Read"],
++        "paths": {"read": ["/Users/zeroclaw/**"], "write": []},
++        "bash": [],
++        "deny": {"bash": []},
++    }))
++
++
++def normalize_allowlist(raw: dict[str, Any] | None) -> dict[str, Any]:
++    raw = raw or {}
++    paths = raw.get("paths") if isinstance(raw.get("paths"), dict) else {}
++    deny = raw.get("deny") if isinstance(raw.get("deny"), dict) else {}
++    return {
++        "tools": list(raw.get("tools") or []),
++        "paths": {
++            "read": list(paths.get("read") or []),
++            "write": list(paths.get("write") or []),
++        },
++        "bash": list(raw.get("bash") or []),
++        "deny": {"bash": list(deny.get("bash") or [])},
++    }
++
++
++def merge_with_default(agent: str, raw: dict[str, Any] | None) -> dict[str, Any]:
++    merged = default_allowlist(agent)
++    if not raw:
++        return merged
++    norm = normalize_allowlist(raw)
++    for key in ("tools", "bash"):
++        if raw.get(key) is not None:
++            merged[key] = norm[key]
++    if raw.get("paths") is not None:
++        merged["paths"] = norm["paths"]
++    if raw.get("deny") is not None:
++        merged["deny"] = norm["deny"]
++    return merged
++
++
++def check_bash(allowlist: dict[str, Any], command: str) -> PermissionCheck:
++    command = (command or "").strip()
++    deny_patterns = allowlist.get("deny", {}).get("bash") or []
++    for pattern in deny_patterns:
++        if fnmatch.fnmatch(command, pattern):
++            return PermissionCheck(False, f"bash denied by pattern {pattern!r}", pattern, "deny")
++    allow_patterns = allowlist.get("bash") or []
++    for pattern in allow_patterns:
++        if fnmatch.fnmatch(command, pattern):
++            return PermissionCheck(True, f"bash allowed by pattern {pattern!r}", pattern)
++    return PermissionCheck(False, "bash command did not match allowlist")
++
++
++def check_tool(allowlist: dict[str, Any], tool_name: str) -> PermissionCheck:
++    for pattern in allowlist.get("tools") or []:
++        if fnmatch.fnmatch(tool_name, pattern):
++            return PermissionCheck(True, f"tool allowed by pattern {pattern!r}", pattern)
++    return PermissionCheck(False, "tool did not match allowlist")
++
++
++def translate_for_cli(agent: str, allowlist: dict[str, Any]) -> dict[str, Any]:
++    allowlist = merge_with_default(agent, allowlist)
++    tools = allowlist["tools"]
++    write_paths = allowlist["paths"]["write"]
++    read_paths = allowlist["paths"]["read"]
++    bash = allowlist["bash"]
++
++    if agent == "claude":
++        allowed_tools = list(tools)
++        allowed_tools.extend(f"Bash({pattern})" for pattern in bash)
++        return {
++            "cli": "claude",
++            "flags": {
++                "allowedTools": allowed_tools,
++                "addDir": sorted(set(read_paths + write_paths)),
++            },
++        }
++    if agent == "codex":
++        return {
++            "cli": "codex",
++            "permission_file": str(Path.home() / ".codex" / "permissions" / f"{agent}.json"),
++            "config": allowlist,
++        }
++    if agent == "gemini":
++        return {
++            "cli": "gemini",
++            "trust_file": str(Path.home() / ".gemini" / "trust.json"),
++            "trusted_dirs": sorted(set(read_paths + write_paths)),
++            "tools": tools,
++        }
++    return {"cli": agent, "config": allowlist}
++
++
++def load_agent_config(path: Path) -> dict[str, Any]:
++    if not path.exists() or yaml is None:
++        return {}
++    text = path.read_text(encoding="utf-8")
++    if text.startswith("---\n"):
++        end = text.find("\n---\n", 4)
++        if end != -1:
++            text = text[end + 5:]
++    return yaml.safe_load(text) or {}
++
++
++def main() -> int:
++    import argparse
++
++    parser = argparse.ArgumentParser(description="Translate AgentOS allowlists for CLI wrappers.")
++    parser.add_argument("agent", help="agent slug, e.g. codex")
++    parser.add_argument("--config", type=Path, default=Path.home() / "Documents" / "obsidian" / "LosAgentOS" / "02-Areas" / "AI-Automation" / "AgentOS" / "runtime" / "agent-config.yaml")
++    args = parser.parse_args()
++
++    cfg = load_agent_config(args.config)
++    raw = ((cfg.get("agents") or {}).get(args.agent) or {}).get("allowlist")
++    print(json.dumps(translate_for_cli(args.agent, merge_with_default(args.agent, raw)), indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
