@@ -1,0 +1,121 @@
+diff --git a/serve.py b/serve.py
+index 2d3b2e1..bffdf2c 100644
+--- a/serve.py
++++ b/serve.py
+@@ -3436,6 +3436,27 @@ async def inspector_session_events(
+     return _read_context_events(agent.strip().lower(), session_id, from_, to)
+ 
+ 
++@app.get("/api/agents/{agent}/context")
++async def agent_context_summary(agent: str, session: str | None = None):
++    agent = agent.strip().lower()
++    sessions = [_inspector_session_record(agent, p) for p in _inspector_files(agent)] if agent in INSPECTOR_ROOTS else []
++    session_id = session or (sessions[0]["id"] if sessions else "")
++    events = _read_context_events(agent, session_id) if session_id else {"events": []}
++    return {
++        "agent": agent,
++        "sessions": sessions,
++        "active_session_id": session_id,
++        "tokens_in": events.get("total_tokens", 0),
++        "tokens_out": 0,
++        "total_tokens": events.get("total_tokens", 0),
++        "context_limit": events.get("context_limit", 0),
++        "context_pct": events.get("context_pct", 0),
++        "model": events.get("model", _read_env_model(agent)),
++        "events": events.get("events", [])[-50:],
++        "error": events.get("error"),
++    }
++
++
+ @app.websocket("/ws/inspector")
+ async def ws_inspector(client_ws: WebSocket):
+     await client_ws.accept()
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index 40f8716..61488b4 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -501,8 +501,21 @@ html[data-theme="dark"] .side-count-badge { color: #0a0b0d; }
+   flex-shrink: 0;
+ }
+ .agent-glyph.lg { width: 42px; height: 42px; font-size: 14px; border-radius: 7px; }
+-.agent-name-txt { font-weight: 500; font-size: 13px; }
++.agent-name-txt { font-weight: 500; font-size: 13px; display: flex; align-items: center; gap: 4px; }
+ .agent-id { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
++.agent-details-chip {
++  padding: 2px 6px;
++  border: 1px solid var(--line);
++  border-radius: 5px;
++  color: var(--ink-3);
++  font-size: 10px;
++  font-weight: 500;
++}
++.row-agent:hover .agent-details-chip,
++.agent-card:hover .agent-details-chip {
++  border-color: rgba(var(--accent-rgb),0.35);
++  color: var(--accent);
++}
+ .task-line { font-size: 12.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+ .task-tools { display: flex; margin-top: 4px; align-items: center; gap: 2px; }
+ 
+diff --git a/ui-static/screens/agent-detail.jsx b/ui-static/screens/agent-detail.jsx
+index e7f8575..409fb4c 100644
+--- a/ui-static/screens/agent-detail.jsx
++++ b/ui-static/screens/agent-detail.jsx
+@@ -169,6 +169,7 @@ function AgentDetailScreen({ agentId, onBack }) {
+ function ContextInspectorPane({ slug }) {
+   const [sessions, setSessions] = React.useState([]);
+   const [sessionId, setSessionId] = React.useState("");
++  const [summary, setSummary] = React.useState(null);
+   const [data, setData] = React.useState(null);
+   const [expanded, setExpanded] = React.useState({});
+   const [hideBodies, setHideBodies] = React.useState(false);
+@@ -200,6 +201,20 @@ function ContextInspectorPane({ slug }) {
+ 
+   React.useEffect(() => { loadSessions(); }, [loadSessions]);
+   React.useEffect(() => { loadEvents(); }, [loadEvents]);
++  React.useEffect(() => {
++    let cancelled = false;
++    const loadSummary = async () => {
++      try {
++        const qs = sessionId ? `?session=${encodeURIComponent(sessionId)}` : "";
++        const r = await fetch(`/api/agents/${encodeURIComponent(slug)}/context${qs}`);
++        const d = await r.json();
++        if (!cancelled) setSummary(d);
++      } catch (_) {}
++    };
++    loadSummary();
++    const t = setInterval(loadSummary, 30000);
++    return () => { cancelled = true; clearInterval(t); };
++  }, [slug, sessionId]);
+   React.useEffect(() => {
+     const proto = location.protocol === "https:" ? "wss:" : "ws:";
+     const ws = new WebSocket(`${proto}//${location.host}/ws/inspector`);
+@@ -242,7 +257,7 @@ function ContextInspectorPane({ slug }) {
+         <div className="context-tokenbar-fill" style={{ width: Math.min(100, pct) + "%" }} />
+       </div>
+       <div className="context-token-meta mono">
+-        <span>{fmtNum(total)} tokens</span>
++        <span>{fmtNum(summary?.total_tokens || total)} tokens</span>
+         <span>{limit ? `${pct.toFixed(1)}% of ${fmtNum(limit)}` : "model limit unknown"}</span>
+         <span>{data?.model || "model unknown"}</span>
+       </div>
+diff --git a/ui-static/screens/fleet.jsx b/ui-static/screens/fleet.jsx
+index c02e4b9..0e4ca8b 100644
+--- a/ui-static/screens/fleet.jsx
++++ b/ui-static/screens/fleet.jsx
+@@ -504,6 +504,7 @@ function FleetScreen({ onSelectAgent, density }) {
+                   <div className="agent-card-meta mono">{a.id} · {a.model}</div>
+                 </div>
+                 <StatusPill status={a.status} />
++                <span className="agent-details-chip mono" title="Open context inspector">details</span>
+               </div>
+               <div className="agent-card-task">{a.task}</div>
+               <div className="agent-card-tools">
+@@ -562,6 +563,7 @@ function FleetScreen({ onSelectAgent, density }) {
+                 <span>
+                   <div className="agent-name-txt">
+                     {a.name}
++                    <span className="agent-details-chip mono" title="Open context inspector">details</span>
+                     <RolePicker agentSlug={a.name} />
+                     <ModelPicker agentSlug={a.name} />
+                     <MuteControl agentSlug={a.name} channel="agenos-dev" />
