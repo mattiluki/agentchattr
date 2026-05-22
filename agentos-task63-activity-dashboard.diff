@@ -1,0 +1,348 @@
+diff --git a/serve.py b/serve.py
+index c9acb76..4b2eeee 100644
+--- a/serve.py
++++ b/serve.py
+@@ -5806,6 +5806,105 @@ async def scheduler_status():
+     return {"now": _dt.datetime.now().isoformat(timespec="seconds"), "entries": out}
+ 
+ 
++@app.get("/api/home")
++async def home_payload():
++    """One-shot Home dashboard payload composed from existing read endpoints."""
++    import json as _json
++    import time as _t
++    from pathlib import Path as _Path
++
++    project_slug = "agentos-roadmap"
++    project = _read_vault_page(PROJECTS_DIR, project_slug, PROJECT_EXTRA_FIELDS) or {}
++    wf = project.get("workflow") or {}
++    active_task_id = wf.get("active_task_id")
++    active_task = next((t for t in (project.get("tasks") or []) if t.get("id") == active_task_id), None)
++    active_phase = _phase_by_name(wf, wf.get("active_phase"))
++    events = _read_phase_events(50, project_slug)
++
++    active_focus = {
++        "project": project_slug,
++        "task_id": active_task_id,
++        "task_title": (active_task or {}).get("title"),
++        "phase": wf.get("active_phase"),
++        "phase_state": wf.get("phase_state") or "idle",
++        "agent": active_phase.get("agent") or wf.get("coordinator_agent"),
++        "last_pulse_iso": next((e.get("ts") for e in events if e.get("task_id") == active_task_id), None),
++    }
++
++    recent_commits = []
++    for ev in events:
++        for item in ev.get("commits") or []:
++            repo = item.get("repo") or ""
++            recent_commits.append({
++                "project": ev.get("project"),
++                "task_id": ev.get("task_id"),
++                "phase": ev.get("phase"),
++                "sha": item.get("sha") or item.get("commit"),
++                "repo": _Path(repo).name if repo else "",
++                "repo_path": repo,
++                "ts": ev.get("ts"),
++                "summary": ev.get("summary"),
++            })
++    recent_commits = recent_commits[:10]
++
++    try:
++        pending_hitl = sorted(await inbox(), key=lambda i: i.get("waitTime") or "")[:5]
++    except Exception:
++        pending_hitl = []
++
++    chat_recent = []
++    for channel in (project.get("channels") or ["general"])[:2]:
++        status, body = _proxy_agentchattr_get("/api/messages", {"channel": channel, "limit": 5})
++        if status != 200:
++            continue
++        try:
++            for msg in _json.loads(body):
++                text = (msg.get("text") or "").strip().replace("\n", " ")
++                ts = msg.get("time") or (
++                    _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(msg.get("timestamp", 0)))
++                    if msg.get("timestamp") else ""
++                )
++                chat_recent.append({
++                    "channel": channel,
++                    "sender": msg.get("sender"),
++                    "ts": ts,
++                    "preview": text[:180],
++                })
++        except Exception:
++            continue
++    chat_recent = chat_recent[-5:][::-1]
++
++    try:
++        scheduler = await scheduler_status()
++        scheduler_next = (scheduler.get("entries") or [])[:3]
++    except Exception:
++        scheduler_next = []
++
++    try:
++        fleet_rows = await fleet()
++    except Exception:
++        fleet_rows = []
++    fleet_summary = {
++        "alive": len([a for a in fleet_rows if a.get("status") == "running"]),
++        "idle": len([a for a in fleet_rows if a.get("status") == "idle"]),
++        "blocked": len([a for a in fleet_rows if a.get("status") == "error"]),
++        "agents": [{
++            "slug": a.get("name"),
++            "state": a.get("status"),
++            "color": ((a.get("_meta") or {}).get("color") or "#8a8178"),
++        } for a in fleet_rows],
++    }
++
++    return {
++        "active_focus": active_focus,
++        "recent_commits": recent_commits,
++        "pending_hitl": pending_hitl,
++        "chat_recent": chat_recent,
++        "scheduler_next": scheduler_next,
++        "fleet": fleet_summary,
++    }
++
++
+ # Static file serving — mount LAST so all explicit /api/* routes register first.
+ app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="static")
+ 
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index a80f276..cdea449 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -3168,6 +3168,7 @@ html[data-theme="dark"] .filter-count { color: #0a0b0d; }
+ <script src="live-overlay.js"></script>
+ <script type="text/babel" src="tweaks-panel.jsx"></script>
+ <script type="text/babel" src="shared.jsx"></script>
++<script type="text/babel" src="screens/home.jsx"></script>
+ <script type="text/babel" src="screens/fleet.jsx"></script>
+ <script type="text/babel" src="screens/agent-edit.jsx"></script>
+ <script type="text/babel" src="screens/agent-detail.jsx"></script>
+diff --git a/ui-static/app.jsx b/ui-static/app.jsx
+index c52eb22..52bfe37 100644
+--- a/ui-static/app.jsx
++++ b/ui-static/app.jsx
+@@ -17,7 +17,7 @@ const ACCENT_RGBS = {
+ 
+ function App() {
+   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+-  const [screen, setScreen] = useState("fleet");
++  const [screen, setScreen] = useState("home");
+   const [selectedAgent, setSelectedAgent] = useState(null);
+   const [cmdkOpen, setCmdkOpen] = useState(false);
+   const vp = useViewport();
+@@ -49,6 +49,7 @@ function App() {
+       <div className="shell">
+         {!vp.isMobile && <Sidebar screen={screen} onNavigate={navigate} />}
+         <main className="main">
++          {screen === "home" && <HomeScreen onNavigate={navigate} />}
+           {screen === "fleet" && <FleetScreen onSelectAgent={selectAgent} density={t.density} />}
+           {screen === "agent" && <AgentDetailScreen agentId={selectedAgent} onBack={() => navigate("fleet")} />}
+           {screen === "inbox" && <InboxScreen />}
+@@ -139,6 +140,7 @@ function TopBar({ onCmdK, isMobile }) {
+ 
+ function BottomTabBar({ screen, onNavigate, onCmdK }) {
+   const tabs = [
++    { id: "home",      label: "Home",    glyph: "◈" },
+     { id: "fleet",     label: "Fleet",   glyph: "▦" },
+     { id: "inbox",     label: "Inbox",   glyph: "▤", badge: 5 },
+     { id: "cmdk",      label: "Search",  glyph: "⌕", action: onCmdK },
+@@ -179,6 +181,7 @@ function Ticker() {
+ 
+ function Sidebar({ screen, onNavigate }) {
+   const nav = [
++    { id: "home",      label: "Home",      glyph: "◈" },
+     { id: "fleet",     label: "Fleet",     glyph: "▦", count: 12 },
+     { id: "chat",      label: "Chat",      glyph: "◌" },
+     { id: "define",    label: "Define",    glyph: "✎" },   // skills · roles · operations · channels
+diff --git a/ui-static/command-palette.jsx b/ui-static/command-palette.jsx
+index db8ef07..d15bb42 100644
+--- a/ui-static/command-palette.jsx
++++ b/ui-static/command-palette.jsx
+@@ -16,6 +16,7 @@ function CommandPalette({ open, onClose, onNavigate, onSelectAgent }) {
+   const items = useMemo(() => {
+     const all = [];
+     [
++      { kind: "nav", label: "Go to Home", id: "home", hint: "G H" },
+       { kind: "nav", label: "Go to Fleet", id: "fleet", hint: "G F" },
+       { kind: "nav", label: "Go to Inbox", id: "inbox", hint: "G I" },
+       { kind: "nav", label: "Go to Runs", id: "runs", hint: "G R" },
+diff --git a/ui-static/screens/home.jsx b/ui-static/screens/home.jsx
+new file mode 100644
+index 0000000..66d693c
+--- /dev/null
++++ b/ui-static/screens/home.jsx
+@@ -0,0 +1,171 @@
++// home.jsx — unified activity dashboard
++
++function HomeScreen({ onNavigate }) {
++  const [data, setData] = React.useState(null);
++  const [loading, setLoading] = React.useState(true);
++  const [error, setError] = React.useState("");
++  const vp = useViewport();
++
++  const load = React.useCallback(() => {
++    setLoading(true);
++    fetch("/api/home")
++      .then((r) => r.json())
++      .then((d) => {
++        setData(d || {});
++        setError("");
++        setLoading(false);
++      })
++      .catch((e) => {
++        setError(String(e).slice(0, 160));
++        setLoading(false);
++      });
++  }, []);
++
++  React.useEffect(() => {
++    load();
++    const t = setInterval(load, 15000);
++    return () => clearInterval(t);
++  }, [load]);
++
++  const focus = data?.active_focus || {};
++  const fleet = data?.fleet || {};
++  const pending = data?.pending_hitl || [];
++  const commits = data?.recent_commits || [];
++  const chat = data?.chat_recent || [];
++  const scheduler = data?.scheduler_next || [];
++
++  return (
++    <div className="screen" style={{padding: 18}}>
++      <div style={{display: "flex", alignItems: "center", gap: 12, marginBottom: 14}}>
++        <div>
++          <div className="screen-eyebrow mono">home</div>
++          <div className="screen-title">Activity dashboard</div>
++          <div className="screen-sub">Current workflow, approvals, commits, chat, scheduler, and fleet state.</div>
++        </div>
++        <div style={{flex: 1}} />
++        <button className="btn btn-ghost mono" onClick={load}>{loading ? "loading..." : "refresh"}</button>
++      </div>
++
++      {error && <div className="define-msg mono" style={{marginBottom: 12}}>error: {error}</div>}
++
++      <div style={{
++        display: "grid",
++        gridTemplateColumns: vp.isMobile ? "1fr" : "minmax(0, 1.2fr) minmax(300px, 0.8fr)",
++        gap: 14,
++      }}>
++        <HomeCard title="Active focus" action="workflows" onNavigate={onNavigate}>
++          <div style={{display: "flex", alignItems: "center", gap: 10}}>
++            <span className="mono" style={{
++              padding: "3px 8px", borderRadius: 999, border: "1px solid var(--line)",
++              background: "var(--accent-soft)", color: "var(--accent-ink)", fontSize: 11,
++            }}>{focus.phase_state || "idle"}</span>
++            <span className="mono muted">{focus.project || "agentos-roadmap"}</span>
++          </div>
++          <div style={{fontSize: 18, fontWeight: 650, marginTop: 10, lineHeight: 1.25}}>
++            {focus.task_title || "No active task"}
++          </div>
++          <div className="mono muted" style={{marginTop: 8}}>
++            task {focus.task_id ? `#${focus.task_id}` : "none"} · phase {focus.phase || "none"} · @{focus.agent || "?"}
++          </div>
++          <div className="mono muted" style={{marginTop: 6, fontSize: 11}}>
++            last event {focus.last_pulse_iso || "not recorded"}
++          </div>
++        </HomeCard>
++
++        <HomeCard title="Fleet snapshot" action="fleet" onNavigate={onNavigate}>
++          <div style={{display: "flex", gap: 14, marginBottom: 12}}>
++            <HomeMetric label="running" value={fleet.alive || 0} color="var(--ok)" />
++            <HomeMetric label="idle" value={fleet.idle || 0} color="var(--warn)" />
++            <HomeMetric label="blocked" value={fleet.blocked || 0} color="var(--err)" />
++          </div>
++          <div style={{display: "flex", gap: 6, overflowX: "auto", paddingBottom: 2}}>
++            {(fleet.agents || []).slice(0, 16).map((a) => (
++              <span key={a.slug} className="mono" title={`${a.slug}: ${a.state}`} style={{
++                display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 7px",
++                border: "1px solid var(--line)", borderRadius: 999, whiteSpace: "nowrap", fontSize: 11,
++              }}>
++                <span style={{width: 7, height: 7, borderRadius: "50%", background: a.color || "var(--muted)"}} />
++                {a.slug}
++              </span>
++            ))}
++          </div>
++        </HomeCard>
++
++        <HomeCard title="Pending HITL" action="inbox" onNavigate={onNavigate}>
++          {pending.length === 0 ? (
++            <HomeEmpty>All approvals up to date.</HomeEmpty>
++          ) : pending.map((item) => (
++            <HomeRow key={item.id} left={item.title || item.id} right={item.waitTime || ""} sub={item.summary || item.target || ""} />
++          ))}
++        </HomeCard>
++
++        <HomeCard title="Recent phase commits" action="workflows" onNavigate={onNavigate}>
++          {commits.length === 0 ? (
++            <HomeEmpty>No phase commits recorded.</HomeEmpty>
++          ) : commits.map((c, i) => (
++            <HomeRow key={`${c.ts}-${c.sha}-${i}`} left={`#${c.task_id || "?"} ${c.phase || "phase"}`} right={c.sha || ""} sub={`${c.repo || "repo"} · ${c.ts || ""}`} mono />
++          ))}
++        </HomeCard>
++
++        <HomeCard title="Project chat" action="chat" onNavigate={onNavigate}>
++          {chat.length === 0 ? (
++            <HomeEmpty>No recent chat messages.</HomeEmpty>
++          ) : chat.map((m, i) => (
++            <HomeRow key={`${m.channel}-${m.ts}-${i}`} left={`#${m.channel} · ${m.sender || "?"}`} right={m.ts || ""} sub={m.preview || ""} />
++          ))}
++        </HomeCard>
++
++        <HomeCard title="Scheduler next fires" action="audit" onNavigate={onNavigate}>
++          {scheduler.length === 0 ? (
++            <HomeEmpty>No scheduled operations due.</HomeEmpty>
++          ) : scheduler.map((s) => (
++            <HomeRow key={`${s.project}-${s.operation}`} left={s.operation} right={s.next_due || ""} sub={`${s.project} · ${s.trigger}`} mono />
++          ))}
++        </HomeCard>
++      </div>
++    </div>
++  );
++}
++
++function HomeCard({ title, action, onNavigate, children }) {
++  return (
++    <section style={{
++      border: "1px solid var(--line)", borderRadius: 8, background: "var(--bg-elev)",
++      padding: 14, minHeight: 154,
++    }}>
++      <div style={{display: "flex", alignItems: "center", gap: 10, marginBottom: 10}}>
++        <div style={{fontWeight: 700, fontSize: 14}}>{title}</div>
++        <div style={{flex: 1}} />
++        {action && <button className="btn btn-ghost mono" style={{fontSize: 11}} onClick={() => onNavigate(action)}>see all</button>}
++      </div>
++      {children}
++    </section>
++  );
++}
++
++function HomeMetric({ label, value, color }) {
++  return (
++    <div>
++      <div style={{fontSize: 24, fontWeight: 700, color}}>{value}</div>
++      <div className="mono muted" style={{fontSize: 11}}>{label}</div>
++    </div>
++  );
++}
++
++function HomeRow({ left, right, sub, mono }) {
++  return (
++    <div style={{padding: "8px 0", borderTop: "1px solid var(--line)"}}>
++      <div style={{display: "flex", gap: 10, alignItems: "baseline"}}>
++        <div className={mono ? "mono" : ""} style={{fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{left}</div>
++        <div className="mono muted" style={{marginLeft: "auto", fontSize: 10.5, whiteSpace: "nowrap"}}>{right}</div>
++      </div>
++      {sub && <div className="muted" style={{fontSize: 12, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{sub}</div>}
++    </div>
++  );
++}
++
++function HomeEmpty({ children }) {
++  return <div className="muted" style={{padding: "18px 0", fontSize: 13}}>{children}</div>;
++}
++
++window.HomeScreen = HomeScreen;

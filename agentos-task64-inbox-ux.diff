@@ -1,0 +1,732 @@
+diff --git a/serve.py b/serve.py
+index c9acb76..551a745 100644
+--- a/serve.py
++++ b/serve.py
+@@ -729,8 +729,18 @@ async def runs(limit: int = 50) -> list[dict]:
+     return out[:limit]
+ 
+ 
++def _inbox_kind(operation: str, target_path: str) -> str:
++    if operation == "env_patch" or target_path.endswith(".env"):
++        return "env-change"
++    if target_path.startswith("04-Wiki/patches/") or target_path.endswith(".diff"):
++        return "repo-patch"
++    if "Lab/Projects/" in target_path or target_path.endswith("agentos-roadmap.md"):
++        return "project-change"
++    return "vault-write"
++
++
+ @app.get("/api/inbox")
+-async def inbox() -> list[dict]:
++async def inbox(kind: str | None = None, agent: str | None = None, project: str | None = None) -> list[dict]:
+     """List pending HITL proposals from 00-Inbox/Outgoing/. Shape matches
+     what the prototype's Inbox screen expects (id, agent, title, summary,
+     urgency, waitTime, risk, impact)."""
+@@ -768,6 +778,14 @@ async def inbox() -> list[dict]:
+         target_path = fm.get("target_path", "?")
+         operation = fm.get("operation", "create")
+         agent_id = fm.get("agent_id", "unknown")
++        item_kind = _inbox_kind(operation, target_path)
++        item_project = fm.get("project") or ("agentos-roadmap" if "agentos" in target_path.lower() else "")
++        if kind and item_kind != kind:
++            continue
++        if agent and agent_id != agent:
++            continue
++        if project and item_project != project:
++            continue
+         rationale = fm.get("rationale", "")
+         age_s = int(now - f.stat().st_mtime)
+         wait = f"{age_s}s" if age_s < 60 else f"{age_s // 60}m" if age_s < 3600 else f"{age_s // 3600}h"
+@@ -833,6 +851,8 @@ async def inbox() -> list[dict]:
+             "waitTime": wait,
+             "risk": risk_map.get(operation, "reversible"),
+             "impact": target_path,
++            "kind": item_kind,
++            "project": item_project,
+             "related_plan": related_plan,
+             "related_reviews": related_reviews,
+             "review_summary": review_summary,
+@@ -841,6 +861,8 @@ async def inbox() -> list[dict]:
+                 "filepath": str(f),
+                 "target_path": target_path,
+                 "operation": operation,
++                "kind": item_kind,
++                "project": item_project,
+                 "agent_id": agent_id,
+                 "rationale": rationale,
+                 "body_preview": body[:400],
+@@ -850,6 +872,32 @@ async def inbox() -> list[dict]:
+     return out
+ 
+ 
++@app.post("/api/inbox/bulk-approve")
++async def inbox_bulk_approve(payload: dict):
++    approved = []
++    failed = []
++    for proposal_id in payload.get("ids") or []:
++        result = await inbox_approve(str(proposal_id))
++        if isinstance(result, dict) and result.get("error"):
++            failed.append({"id": proposal_id, "error": result.get("error")})
++        else:
++            approved.append({"id": proposal_id, "result": result})
++    return {"ok": len(failed) == 0, "approved": approved, "failed": failed}
++
++
++@app.post("/api/inbox/bulk-reject")
++async def inbox_bulk_reject(payload: dict):
++    rejected = []
++    failed = []
++    for proposal_id in payload.get("ids") or []:
++        result = await inbox_reject(str(proposal_id))
++        if isinstance(result, dict) and result.get("error"):
++            failed.append({"id": proposal_id, "error": result.get("error")})
++        else:
++            rejected.append({"id": proposal_id, "result": result})
++    return {"ok": len(failed) == 0, "rejected": rejected, "failed": failed}
++
++
+ @app.post("/api/inbox/{proposal_id}/approve")
+ async def inbox_approve(proposal_id: str):
+     """Approve a HITL proposal by moving the file from Outgoing/ to its
+@@ -5806,6 +5854,105 @@ async def scheduler_status():
+     return {"now": _dt.datetime.now().isoformat(timespec="seconds"), "entries": out}
+ 
+ 
++@app.get("/api/home")
++async def home_payload():
++    """One-shot Home dashboard payload composed from existing read endpoints."""
++    import json as _json
++    import time as _t
++    from pathlib import Path as _Path
++
++    project_slug = "agentos-roadmap"
++    project = _read_vault_page(PROJECTS_DIR, project_slug, PROJECT_EXTRA_FIELDS) or {}
++    wf = project.get("workflow") or {}
++    active_task_id = wf.get("active_task_id")
++    active_task = next((t for t in (project.get("tasks") or []) if t.get("id") == active_task_id), None)
++    active_phase = _phase_by_name(wf, wf.get("active_phase"))
++    events = _read_phase_events(50, project_slug)
++
++    active_focus = {
++        "project": project_slug,
++        "task_id": active_task_id,
++        "task_title": (active_task or {}).get("title"),
++        "phase": wf.get("active_phase"),
++        "phase_state": wf.get("phase_state") or "idle",
++        "agent": active_phase.get("agent") or wf.get("coordinator_agent"),
++        "last_pulse_iso": next((e.get("ts") for e in events if e.get("task_id") == active_task_id), None),
++    }
++
++    recent_commits = []
++    for ev in events:
++        for item in ev.get("commits") or []:
++            repo = item.get("repo") or ""
++            recent_commits.append({
++                "project": ev.get("project"),
++                "task_id": ev.get("task_id"),
++                "phase": ev.get("phase"),
++                "sha": item.get("sha") or item.get("commit"),
++                "repo": _Path(repo).name if repo else "",
++                "repo_path": repo,
++                "ts": ev.get("ts"),
++                "summary": ev.get("summary"),
++            })
++    recent_commits = recent_commits[:10]
++
++    try:
++        pending_hitl = sorted(await inbox(), key=lambda i: i.get("waitTime") or "")[:5]
++    except Exception:
++        pending_hitl = []
++
++    chat_recent = []
++    for channel in (project.get("channels") or ["general"])[:2]:
++        status, body = _proxy_agentchattr_get("/api/messages", {"channel": channel, "limit": 5})
++        if status != 200:
++            continue
++        try:
++            for msg in _json.loads(body):
++                text = (msg.get("text") or "").strip().replace("\n", " ")
++                ts = msg.get("time") or (
++                    _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(msg.get("timestamp", 0)))
++                    if msg.get("timestamp") else ""
++                )
++                chat_recent.append({
++                    "channel": channel,
++                    "sender": msg.get("sender"),
++                    "ts": ts,
++                    "preview": text[:180],
++                })
++        except Exception:
++            continue
++    chat_recent = chat_recent[-5:][::-1]
++
++    try:
++        scheduler = await scheduler_status()
++        scheduler_next = (scheduler.get("entries") or [])[:3]
++    except Exception:
++        scheduler_next = []
++
++    try:
++        fleet_rows = await fleet()
++    except Exception:
++        fleet_rows = []
++    fleet_summary = {
++        "alive": len([a for a in fleet_rows if a.get("status") == "running"]),
++        "idle": len([a for a in fleet_rows if a.get("status") == "idle"]),
++        "blocked": len([a for a in fleet_rows if a.get("status") == "error"]),
++        "agents": [{
++            "slug": a.get("name"),
++            "state": a.get("status"),
++            "color": ((a.get("_meta") or {}).get("color") or "#8a8178"),
++        } for a in fleet_rows],
++    }
++
++    return {
++        "active_focus": active_focus,
++        "recent_commits": recent_commits,
++        "pending_hitl": pending_hitl,
++        "chat_recent": chat_recent,
++        "scheduler_next": scheduler_next,
++        "fleet": fleet_summary,
++    }
++
++
+ # Static file serving — mount LAST so all explicit /api/* routes register first.
+ app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="static")
+ 
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index a80f276..48a6909 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -804,17 +804,66 @@ html[data-theme="dark"] .tag-think { background: rgba(255,255,255,0.06); }
+   border-right: 1px solid var(--line);
+   overflow-y: auto;
+ }
++.inbox-select-all {
++  display: flex; align-items: center; gap: 8px;
++  padding: 8px 18px;
++  border-bottom: 1px solid var(--line);
++  background: var(--bg-sunken);
++  font-size: 11px; color: var(--ink-3);
++}
++.inbox-row-wrap {
++  border-bottom: 1px solid var(--line);
++  background: transparent;
++}
++.inbox-row-wrap:hover { background: var(--bg-sunken); }
+ .inbox-row {
+   display: flex; gap: 10px;
+   width: 100%;
+-  padding: 14px 18px;
++  padding: 0 12px 0 14px;
++  background: transparent; border: 0;
++  color: inherit; font: inherit;
++  align-items: stretch;
++}
++.inbox-row-main {
++  display: flex; gap: 10px; flex: 1;
++  padding: 14px 0;
+   background: transparent; border: 0;
+-  border-bottom: 1px solid var(--line);
+   text-align: left; cursor: pointer;
+   color: inherit; font: inherit;
+ }
+-.inbox-row:hover { background: var(--bg-sunken); }
+-.inbox-row-active { background: var(--bg-elev); border-left: 2px solid var(--accent); padding-left: 16px; }
++.inbox-row-check { align-self: center; flex-shrink: 0; }
++.inbox-diff-toggle {
++  align-self: center;
++  border: 1px solid var(--line);
++  border-radius: 5px;
++  background: var(--bg-elev);
++  color: var(--ink-3);
++  font-size: 10.5px;
++  padding: 3px 7px;
++  cursor: pointer;
++}
++.inbox-diff-toggle:hover { color: var(--accent); border-color: rgba(var(--accent-rgb),0.35); }
++.inbox-row-active { background: var(--bg-elev); border-left: 2px solid var(--accent); }
++.inbox-inline-diff { padding: 0 14px 12px 42px; }
++.inbox-inline-diff .diff-block {
++  margin: 0;
++  max-height: 220px;
++  overflow: auto;
++  white-space: pre-wrap;
++  word-break: break-word;
++}
++.inbox-bulk-bar {
++  position: fixed;
++  right: 22px;
++  bottom: 22px;
++  z-index: 10;
++  display: flex; align-items: center; gap: 8px;
++  padding: 10px 12px;
++  border: 1px solid var(--line-strong);
++  border-radius: 8px;
++  background: var(--bg-elev);
++  box-shadow: 0 12px 32px rgba(0,0,0,0.16);
++}
+ .urgency {
+   width: 3px; flex-shrink: 0;
+   border-radius: 2px;
+@@ -3168,6 +3217,7 @@ html[data-theme="dark"] .filter-count { color: #0a0b0d; }
+ <script src="live-overlay.js"></script>
+ <script type="text/babel" src="tweaks-panel.jsx"></script>
+ <script type="text/babel" src="shared.jsx"></script>
++<script type="text/babel" src="screens/home.jsx"></script>
+ <script type="text/babel" src="screens/fleet.jsx"></script>
+ <script type="text/babel" src="screens/agent-edit.jsx"></script>
+ <script type="text/babel" src="screens/agent-detail.jsx"></script>
+diff --git a/ui-static/app.jsx b/ui-static/app.jsx
+index c52eb22..52bfe37 100644
+--- a/ui-static/app.jsx
++++ b/ui-static/app.jsx
+@@ -17,7 +17,7 @@ const ACCENT_RGBS = {
+ 
+ function App() {
+   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+-  const [screen, setScreen] = useState("fleet");
++  const [screen, setScreen] = useState("home");
+   const [selectedAgent, setSelectedAgent] = useState(null);
+   const [cmdkOpen, setCmdkOpen] = useState(false);
+   const vp = useViewport();
+@@ -49,6 +49,7 @@ function App() {
+       <div className="shell">
+         {!vp.isMobile && <Sidebar screen={screen} onNavigate={navigate} />}
+         <main className="main">
++          {screen === "home" && <HomeScreen onNavigate={navigate} />}
+           {screen === "fleet" && <FleetScreen onSelectAgent={selectAgent} density={t.density} />}
+           {screen === "agent" && <AgentDetailScreen agentId={selectedAgent} onBack={() => navigate("fleet")} />}
+           {screen === "inbox" && <InboxScreen />}
+@@ -139,6 +140,7 @@ function TopBar({ onCmdK, isMobile }) {
+ 
+ function BottomTabBar({ screen, onNavigate, onCmdK }) {
+   const tabs = [
++    { id: "home",      label: "Home",    glyph: "◈" },
+     { id: "fleet",     label: "Fleet",   glyph: "▦" },
+     { id: "inbox",     label: "Inbox",   glyph: "▤", badge: 5 },
+     { id: "cmdk",      label: "Search",  glyph: "⌕", action: onCmdK },
+@@ -179,6 +181,7 @@ function Ticker() {
+ 
+ function Sidebar({ screen, onNavigate }) {
+   const nav = [
++    { id: "home",      label: "Home",      glyph: "◈" },
+     { id: "fleet",     label: "Fleet",     glyph: "▦", count: 12 },
+     { id: "chat",      label: "Chat",      glyph: "◌" },
+     { id: "define",    label: "Define",    glyph: "✎" },   // skills · roles · operations · channels
+diff --git a/ui-static/command-palette.jsx b/ui-static/command-palette.jsx
+index db8ef07..d15bb42 100644
+--- a/ui-static/command-palette.jsx
++++ b/ui-static/command-palette.jsx
+@@ -16,6 +16,7 @@ function CommandPalette({ open, onClose, onNavigate, onSelectAgent }) {
+   const items = useMemo(() => {
+     const all = [];
+     [
++      { kind: "nav", label: "Go to Home", id: "home", hint: "G H" },
+       { kind: "nav", label: "Go to Fleet", id: "fleet", hint: "G F" },
+       { kind: "nav", label: "Go to Inbox", id: "inbox", hint: "G I" },
+       { kind: "nav", label: "Go to Runs", id: "runs", hint: "G R" },
+diff --git a/ui-static/screens/other-screens.jsx b/ui-static/screens/other-screens.jsx
+index 7dd052e..525943a 100644
+--- a/ui-static/screens/other-screens.jsx
++++ b/ui-static/screens/other-screens.jsx
+@@ -10,13 +10,30 @@ function InboxScreen() {
+   const [search, setSearch] = useState("");
+   const [urgencyF, setUrgencyF] = useState([]);
+   const [riskF, setRiskF] = useState([]);
+-  const [agentF, setAgentF] = useState([]);
++  const savedFilters = (() => {
++    try { return JSON.parse(localStorage.getItem("inboxFilters") || "{}"); }
++    catch { return {}; }
++  })();
++  const [agentF, setAgentF] = useState(savedFilters.agentF || []);
++  const [kindF, setKindF] = useState(savedFilters.kindF || []);
++  const [projectF, setProjectF] = useState(savedFilters.projectF || []);
+   const [waitBand, setWaitBand] = useState(null);
++  const [sort, setSort] = useState(savedFilters.sort || "oldest");
+   const [showFilters, setShowFilters] = useState(false);
+-
+-  const urgencyCounts = {}; window.INBOX.forEach((i) => { urgencyCounts[i.urgency] = (urgencyCounts[i.urgency] || 0) + 1; });
+-  const riskCounts = {}; window.INBOX.forEach((i) => { riskCounts[i.risk] = (riskCounts[i.risk] || 0) + 1; });
+-  const agentCounts = {}; window.INBOX.forEach((i) => { agentCounts[i.agent] = (agentCounts[i.agent] || 0) + 1; });
++  const [selectedIds, setSelectedIds] = useState(new Set());
++  const [expandedId, setExpandedId] = useState(null);
++  const [bulkBusy, setBulkBusy] = useState(false);
++
++  const countBy = (key) => {
++    const counts = {};
++    items.forEach((i) => { const v = i[key] || "unknown"; counts[v] = (counts[v] || 0) + 1; });
++    return counts;
++  };
++  const urgencyCounts = countBy("urgency");
++  const riskCounts = countBy("risk");
++  const agentCounts = countBy("agent");
++  const kindCounts = countBy("kind");
++  const projectCounts = countBy("project");
+ 
+   const waitBands = {
+     "< 1m":  (w) => w === "now" || w.includes("s"),
+@@ -29,16 +46,38 @@ function InboxScreen() {
+     if (urgencyF.length) list = list.filter((i) => urgencyF.includes(i.urgency));
+     if (riskF.length)    list = list.filter((i) => riskF.includes(i.risk));
+     if (agentF.length)   list = list.filter((i) => agentF.includes(i.agent));
++    if (kindF.length)    list = list.filter((i) => kindF.includes(i.kind || "vault-write"));
++    if (projectF.length) list = list.filter((i) => projectF.includes(i.project || "unknown"));
+     if (waitBand)        list = list.filter((i) => waitBands[waitBand](i.waitTime));
+     if (search) {
+       const q = search.toLowerCase();
+-      list = list.filter((i) => i.title.toLowerCase().includes(q) || i.summary.toLowerCase().includes(q) || i.agent.includes(q));
++      list = list.filter((i) => i.title.toLowerCase().includes(q) || i.summary.toLowerCase().includes(q) || i.agent.includes(q) || (i.project || "").includes(q));
+     }
++    if (sort === "newest") list = [...list].reverse();
++    if (sort === "source") list = [...list].sort((a, b) => (a.agent || "").localeCompare(b.agent || "") || a.title.localeCompare(b.title));
++    if (sort === "project") list = [...list].sort((a, b) => (a.project || "").localeCompare(b.project || "") || a.title.localeCompare(b.title));
+     return list;
+-  }, [items, urgencyF, riskF, agentF, waitBand, search]);
++  }, [items, urgencyF, riskF, agentF, kindF, projectF, waitBand, search, sort]);
+ 
+-  const activeFilterCount = urgencyF.length + riskF.length + agentF.length + (waitBand ? 1 : 0);
+-  const reset = () => { setUrgencyF([]); setRiskF([]); setAgentF([]); setWaitBand(null); setSearch(""); };
++  useEffect(() => {
++    localStorage.setItem("inboxFilters", JSON.stringify({ kindF, projectF, agentF, sort }));
++  }, [kindF, projectF, agentF, sort]);
++
++  const activeFilterCount = urgencyF.length + riskF.length + agentF.length + kindF.length + projectF.length + (waitBand ? 1 : 0);
++  const reset = () => { setUrgencyF([]); setRiskF([]); setAgentF([]); setKindF([]); setProjectF([]); setWaitBand(null); setSearch(""); };
++  const visibleIds = filtered.map((i) => i.id);
++  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
++  const toggleSelected = (id) => setSelectedIds((cur) => {
++    const next = new Set(cur);
++    next.has(id) ? next.delete(id) : next.add(id);
++    return next;
++  });
++  const toggleVisible = () => setSelectedIds((cur) => {
++    const next = new Set(cur);
++    if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id));
++    else visibleIds.forEach((id) => next.add(id));
++    return next;
++  });
+ 
+   const decide = (id, action, payload) => {
+     // Polish: also POST to real HITL endpoints. Approve/reject hit
+@@ -50,6 +89,7 @@ function InboxScreen() {
+     const remaining = items.filter((x) => x.id !== id);
+     if (remaining.length) setSelected(remaining[0].id);
+     setEditingApproval(null);
++    setSelectedIds((cur) => { const next = new Set(cur); next.delete(id); return next; });
+     if (action === "approve" || action === "edit-approve") {
+       fetch(`/api/inbox/${encodeURIComponent(id)}/approve`, { method: "POST" })
+         .then(r => r.json())
+@@ -64,6 +104,35 @@ function InboxScreen() {
+     }
+   };
+ 
++  const bulkDecide = async (action) => {
++    const ids = Array.from(selectedIds).filter((id) => items.some((i) => i.id === id));
++    if (!ids.length) return;
++    const verb = action === "approve" ? "Approve" : "Reject";
++    const kinds = Array.from(new Set(ids.map((id) => items.find((i) => i.id === id)?.kind || "unknown"))).join(", ");
++    if (!confirm(`${verb} ${ids.length} selected proposal${ids.length > 1 ? "s" : ""}?\n\nKinds: ${kinds}`)) return;
++    setBulkBusy(true);
++    try {
++      const r = await fetch(`/api/inbox/bulk-${action}`, {
++        method: "POST",
++        headers: {"Content-Type": "application/json"},
++        body: JSON.stringify({ ids }),
++      });
++      const d = await r.json();
++      const done = (action === "approve" ? d.approved : d.rejected || []).map((x) => x.id);
++      setItems((arr) => arr.filter((x) => !done.includes(x.id)));
++      setSelectedIds((cur) => {
++        const next = new Set(cur);
++        done.forEach((id) => next.delete(id));
++        return next;
++      });
++      if (done.includes(selected)) setSelected(done.length < items.length ? items.find((i) => !done.includes(i.id))?.id : null);
++      if ((d.failed || []).length) alert(`${d.failed.length} failed; failed items stayed selected.`);
++    } catch (e) {
++      alert(`Bulk ${action} failed: ${String(e).slice(0, 120)}`);
++    }
++    setBulkBusy(false);
++  };
++
+   return (
+     <div className="screen inbox-screen">
+       {!(vp.isMobile && mobileShowDetail) && <div className="inbox-header">
+@@ -96,6 +165,10 @@ function InboxScreen() {
+ 
+           {showFilters && (
+             <div className="filter-panel filter-panel-inbox">
++              <FilterGroup label="kind" multi value={kindF} onChange={setKindF}
++                options={Object.keys(kindCounts).map((k) => ({ id: k, label: k, count: kindCounts[k] }))} />
++              <FilterGroup label="project" multi value={projectF} onChange={setProjectF}
++                options={Object.keys(projectCounts).map((k) => ({ id: k, label: k, count: projectCounts[k] }))} />
+               <FilterGroup label="urgency" multi value={urgencyF} onChange={setUrgencyF}
+                 options={Object.keys(urgencyCounts).map((k) => ({ id: k, label: k, count: urgencyCounts[k] }))} />
+               <FilterGroup label="risk" multi value={riskF} onChange={setRiskF}
+@@ -104,28 +177,58 @@ function InboxScreen() {
+                 options={Object.keys(agentCounts).map((k) => ({ id: k, label: k, count: agentCounts[k] }))} />
+               <FilterGroup label="waiting" value={waitBand} onChange={setWaitBand}
+                 options={Object.keys(waitBands).map((k) => ({ id: k, label: k }))} />
++              <div className="sort">
++                <span className="sort-lbl mono">sort</span>
++                <select value={sort} onChange={(e) => setSort(e.target.value)}>
++                  <option value="oldest">oldest first</option>
++                  <option value="newest">newest first</option>
++                  <option value="source">by source</option>
++                  <option value="project">by project</option>
++                </select>
++              </div>
+               {activeFilterCount > 0 && (
+                 <button className="lib-filter-reset mono" onClick={reset}>clear all</button>
+               )}
+             </div>
+           )}
++          {filtered.length > 0 && (
++            <label className="inbox-select-all mono">
++              <input type="checkbox" checked={allVisibleSelected} onChange={toggleVisible} />
++              <span>{allVisibleSelected ? "clear visible" : "select visible"} · {filtered.length}</span>
++            </label>
++          )}
+           {filtered.map((i) => (
+-            <button
+-              key={i.id}
+-              className={"inbox-row " + (selected === i.id && !vp.isMobile ? "inbox-row-active" : "")}
+-              onClick={() => { setSelected(i.id); if (vp.isMobile) setMobileShowDetail(true); }}
+-            >
+-              <span className={"urgency urgency-" + i.urgency} />
+-              <div className="inbox-row-body">
+-                <div className="inbox-row-meta mono">
+-                  <span>{i.agent}</span>
+-                  <span className="dot-sep">·</span>
+-                  <span>{i.id}</span>
+-                  <span className="inbox-wait">waiting {i.waitTime}</span>
+-                </div>
+-                <div className="inbox-row-title">{i.title}</div>
++            <div key={i.id} className={"inbox-row-wrap " + (selected === i.id && !vp.isMobile ? "inbox-row-active" : "")}>
++              <div className="inbox-row">
++                <input className="inbox-row-check" type="checkbox"
++                  checked={selectedIds.has(i.id)}
++                  onChange={() => toggleSelected(i.id)}
++                  onClick={(e) => e.stopPropagation()} />
++                <button className="inbox-row-main" onClick={() => { setSelected(i.id); if (vp.isMobile) setMobileShowDetail(true); }}>
++                  <span className={"urgency urgency-" + i.urgency} />
++                  <div className="inbox-row-body">
++                    <div className="inbox-row-meta mono">
++                      <span>{i.agent}</span>
++                      <span className="dot-sep">·</span>
++                      <span>{i.kind || "vault-write"}</span>
++                      <span className="dot-sep">·</span>
++                      <span>{i.project || "unknown"}</span>
++                      <span className="inbox-wait">waiting {i.waitTime}</span>
++                    </div>
++                    <div className="inbox-row-title">{i.title}</div>
++                  </div>
++                </button>
++                <button className="inbox-diff-toggle mono" onClick={() => setExpandedId(expandedId === i.id ? null : i.id)}>
++                  {expandedId === i.id ? "hide" : "diff"}
++                </button>
+               </div>
+-            </button>
++              {expandedId === i.id && (
++                <div className="inbox-inline-diff">
++                  <div className="inbox-section-h">inline proposal preview</div>
++                  <pre className="diff-block mono">{(i._meta && i._meta.body_preview) || i.summary || "No preview available."}</pre>
++                </div>
++              )}
++            </div>
+           ))}
+           {filtered.length === 0 && (
+             <div className="inbox-empty">
+@@ -238,6 +341,14 @@ function InboxScreen() {
+           onReject={() => decide(editingApproval.id, "reject")}
+         />
+       )}
++      {selectedIds.size > 0 && (
++        <div className="inbox-bulk-bar">
++          <span className="mono">{selectedIds.size} selected</span>
++          <button className="btn btn-primary" disabled={bulkBusy} onClick={() => bulkDecide("approve")}>Approve selected</button>
++          <button className="btn btn-ghost" disabled={bulkBusy} onClick={() => bulkDecide("reject")}>Reject selected</button>
++          <button className="btn btn-ghost" disabled={bulkBusy} onClick={() => setSelectedIds(new Set())}>Clear</button>
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/ui-static/screens/home.jsx b/ui-static/screens/home.jsx
+new file mode 100644
+index 0000000..66d693c
+--- /dev/null
++++ b/ui-static/screens/home.jsx
+@@ -0,0 +1,171 @@
++// home.jsx — unified activity dashboard
++
++function HomeScreen({ onNavigate }) {
++  const [data, setData] = React.useState(null);
++  const [loading, setLoading] = React.useState(true);
++  const [error, setError] = React.useState("");
++  const vp = useViewport();
++
++  const load = React.useCallback(() => {
++    setLoading(true);
++    fetch("/api/home")
++      .then((r) => r.json())
++      .then((d) => {
++        setData(d || {});
++        setError("");
++        setLoading(false);
++      })
++      .catch((e) => {
++        setError(String(e).slice(0, 160));
++        setLoading(false);
++      });
++  }, []);
++
++  React.useEffect(() => {
++    load();
++    const t = setInterval(load, 15000);
++    return () => clearInterval(t);
++  }, [load]);
++
++  const focus = data?.active_focus || {};
++  const fleet = data?.fleet || {};
++  const pending = data?.pending_hitl || [];
++  const commits = data?.recent_commits || [];
++  const chat = data?.chat_recent || [];
++  const scheduler = data?.scheduler_next || [];
++
++  return (
++    <div className="screen" style={{padding: 18}}>
++      <div style={{display: "flex", alignItems: "center", gap: 12, marginBottom: 14}}>
++        <div>
++          <div className="screen-eyebrow mono">home</div>
++          <div className="screen-title">Activity dashboard</div>
++          <div className="screen-sub">Current workflow, approvals, commits, chat, scheduler, and fleet state.</div>
++        </div>
++        <div style={{flex: 1}} />
++        <button className="btn btn-ghost mono" onClick={load}>{loading ? "loading..." : "refresh"}</button>
++      </div>
++
++      {error && <div className="define-msg mono" style={{marginBottom: 12}}>error: {error}</div>}
++
++      <div style={{
++        display: "grid",
++        gridTemplateColumns: vp.isMobile ? "1fr" : "minmax(0, 1.2fr) minmax(300px, 0.8fr)",
++        gap: 14,
++      }}>
++        <HomeCard title="Active focus" action="workflows" onNavigate={onNavigate}>
++          <div style={{display: "flex", alignItems: "center", gap: 10}}>
++            <span className="mono" style={{
++              padding: "3px 8px", borderRadius: 999, border: "1px solid var(--line)",
++              background: "var(--accent-soft)", color: "var(--accent-ink)", fontSize: 11,
++            }}>{focus.phase_state || "idle"}</span>
++            <span className="mono muted">{focus.project || "agentos-roadmap"}</span>
++          </div>
++          <div style={{fontSize: 18, fontWeight: 650, marginTop: 10, lineHeight: 1.25}}>
++            {focus.task_title || "No active task"}
++          </div>
++          <div className="mono muted" style={{marginTop: 8}}>
++            task {focus.task_id ? `#${focus.task_id}` : "none"} · phase {focus.phase || "none"} · @{focus.agent || "?"}
++          </div>
++          <div className="mono muted" style={{marginTop: 6, fontSize: 11}}>
++            last event {focus.last_pulse_iso || "not recorded"}
++          </div>
++        </HomeCard>
++
++        <HomeCard title="Fleet snapshot" action="fleet" onNavigate={onNavigate}>
++          <div style={{display: "flex", gap: 14, marginBottom: 12}}>
++            <HomeMetric label="running" value={fleet.alive || 0} color="var(--ok)" />
++            <HomeMetric label="idle" value={fleet.idle || 0} color="var(--warn)" />
++            <HomeMetric label="blocked" value={fleet.blocked || 0} color="var(--err)" />
++          </div>
++          <div style={{display: "flex", gap: 6, overflowX: "auto", paddingBottom: 2}}>
++            {(fleet.agents || []).slice(0, 16).map((a) => (
++              <span key={a.slug} className="mono" title={`${a.slug}: ${a.state}`} style={{
++                display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 7px",
++                border: "1px solid var(--line)", borderRadius: 999, whiteSpace: "nowrap", fontSize: 11,
++              }}>
++                <span style={{width: 7, height: 7, borderRadius: "50%", background: a.color || "var(--muted)"}} />
++                {a.slug}
++              </span>
++            ))}
++          </div>
++        </HomeCard>
++
++        <HomeCard title="Pending HITL" action="inbox" onNavigate={onNavigate}>
++          {pending.length === 0 ? (
++            <HomeEmpty>All approvals up to date.</HomeEmpty>
++          ) : pending.map((item) => (
++            <HomeRow key={item.id} left={item.title || item.id} right={item.waitTime || ""} sub={item.summary || item.target || ""} />
++          ))}
++        </HomeCard>
++
++        <HomeCard title="Recent phase commits" action="workflows" onNavigate={onNavigate}>
++          {commits.length === 0 ? (
++            <HomeEmpty>No phase commits recorded.</HomeEmpty>
++          ) : commits.map((c, i) => (
++            <HomeRow key={`${c.ts}-${c.sha}-${i}`} left={`#${c.task_id || "?"} ${c.phase || "phase"}`} right={c.sha || ""} sub={`${c.repo || "repo"} · ${c.ts || ""}`} mono />
++          ))}
++        </HomeCard>
++
++        <HomeCard title="Project chat" action="chat" onNavigate={onNavigate}>
++          {chat.length === 0 ? (
++            <HomeEmpty>No recent chat messages.</HomeEmpty>
++          ) : chat.map((m, i) => (
++            <HomeRow key={`${m.channel}-${m.ts}-${i}`} left={`#${m.channel} · ${m.sender || "?"}`} right={m.ts || ""} sub={m.preview || ""} />
++          ))}
++        </HomeCard>
++
++        <HomeCard title="Scheduler next fires" action="audit" onNavigate={onNavigate}>
++          {scheduler.length === 0 ? (
++            <HomeEmpty>No scheduled operations due.</HomeEmpty>
++          ) : scheduler.map((s) => (
++            <HomeRow key={`${s.project}-${s.operation}`} left={s.operation} right={s.next_due || ""} sub={`${s.project} · ${s.trigger}`} mono />
++          ))}
++        </HomeCard>
++      </div>
++    </div>
++  );
++}
++
++function HomeCard({ title, action, onNavigate, children }) {
++  return (
++    <section style={{
++      border: "1px solid var(--line)", borderRadius: 8, background: "var(--bg-elev)",
++      padding: 14, minHeight: 154,
++    }}>
++      <div style={{display: "flex", alignItems: "center", gap: 10, marginBottom: 10}}>
++        <div style={{fontWeight: 700, fontSize: 14}}>{title}</div>
++        <div style={{flex: 1}} />
++        {action && <button className="btn btn-ghost mono" style={{fontSize: 11}} onClick={() => onNavigate(action)}>see all</button>}
++      </div>
++      {children}
++    </section>
++  );
++}
++
++function HomeMetric({ label, value, color }) {
++  return (
++    <div>
++      <div style={{fontSize: 24, fontWeight: 700, color}}>{value}</div>
++      <div className="mono muted" style={{fontSize: 11}}>{label}</div>
++    </div>
++  );
++}
++
++function HomeRow({ left, right, sub, mono }) {
++  return (
++    <div style={{padding: "8px 0", borderTop: "1px solid var(--line)"}}>
++      <div style={{display: "flex", gap: 10, alignItems: "baseline"}}>
++        <div className={mono ? "mono" : ""} style={{fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{left}</div>
++        <div className="mono muted" style={{marginLeft: "auto", fontSize: 10.5, whiteSpace: "nowrap"}}>{right}</div>
++      </div>
++      {sub && <div className="muted" style={{fontSize: 12, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{sub}</div>}
++    </div>
++  );
++}
++
++function HomeEmpty({ children }) {
++  return <div className="muted" style={{padding: "18px 0", fontSize: 13}}>{children}</div>;
++}
++
++window.HomeScreen = HomeScreen;

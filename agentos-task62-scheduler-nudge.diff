@@ -1,0 +1,114 @@
+diff --git a/serve.py b/serve.py
+index 33cfa72..c9acb76 100644
+--- a/serve.py
++++ b/serve.py
+@@ -3851,6 +3851,8 @@ SCHEDULER_PERIODS_SEC = {
+     "schedule:daily":   86400,
+     "schedule:weekly":  604800,
+ }
++SCHEDULER_NUDGE_MAX_IDS = 50
++SCHEDULER_NUDGE_AGE_SEC = 7 * 86400
+ 
+ 
+ def _load_scheduler_state() -> dict:
+@@ -3868,6 +3870,82 @@ def _save_scheduler_state(state: dict):
+     SCHEDULER_STATE.write_text(_j.dumps(state, indent=2))
+ 
+ 
++async def _fire_scheduler_nudge(op_slug: str, project: dict, op: dict, now_ts: float):
++    import datetime as _dt
++
++    channels = project.get("channels") or []
++    channel = (op.get("_frontmatter") or {}).get("channel") or (channels[0] if channels else "general")
++    fm = dict(project.get("_frontmatter") or {})
++    wf = fm.get("workflow") or {}
++    recent_raw = wf.get("recently_nudged_ids") or []
++    recent = []
++    recent_ids = set()
++    cutoff = now_ts - SCHEDULER_NUDGE_AGE_SEC
++    for item in recent_raw:
++        if isinstance(item, dict):
++            task_id = item.get("id")
++            ts = float(item.get("ts") or 0)
++        else:
++            task_id = item
++            ts = 0
++        if task_id is None or (ts and ts < cutoff):
++            continue
++        recent.append({"id": task_id, "ts": ts or now_ts})
++        recent_ids.add(task_id)
++
++    candidates = []
++    for task in sorted(project.get("tasks") or [], key=lambda t: t.get("id") or 0):
++        try:
++            task_id = task.get("id")
++            if task.get("status") == "open" and not task.get("assignee") and task_id not in recent_ids:
++                candidates.append(task)
++        except Exception:
++            continue
++
++    if not candidates:
++        log.info(f"scheduler-nudge: skipped {project['slug']!r} — no unclaimed open tasks")
++        if len(recent) != len(recent_raw):
++            wf["recently_nudged_ids"] = recent[-SCHEDULER_NUDGE_MAX_IDS:]
++            fm["workflow"] = wf
++            _write_vault_page(PROJECTS_DIR, project["slug"], fm, project.get("body") or "")
++        return False
++
++    shown = candidates[:10]
++    more = len(candidates) - len(shown)
++    lines = [f"📋 Scheduler nudge · {len(candidates)} unclaimed open tasks in `{project['slug']}`:"]
++    for task in shown:
++        title = str(task.get("title") or "(untitled)").strip()
++        notes = str(task.get("notes") or "")
++        size = ""
++        for marker in ("S", "M", "L"):
++            if f"size:{marker}" in notes or f"({marker})" in notes:
++                size = f" ({marker})"
++                break
++        lines.append(f"- #{task.get('id')} {title}{size}")
++    if more > 0:
++        lines.append(f"- +{more} more")
++
++    try:
++        await chat_send({
++            "channel": channel,
++            "sender": "scheduler",
++            "text": "\n".join(lines),
++            "no_preset": True,
++            "no_project": True,
++        })
++        stamp = _dt.datetime.fromtimestamp(now_ts).isoformat(timespec="seconds")
++        for task in candidates:
++            recent.append({"id": task.get("id"), "ts": now_ts, "at": stamp})
++        wf["recently_nudged_ids"] = recent[-SCHEDULER_NUDGE_MAX_IDS:]
++        fm["workflow"] = wf
++        _write_vault_page(PROJECTS_DIR, project["slug"], fm, project.get("body") or "")
++        log.info(f"scheduler-nudge: posted {len(candidates)} task(s) → #{channel} (project {project['slug']!r})")
++        return True
++    except Exception as e:
++        log.warning(f"scheduler-nudge: failed for {project['slug']!r}: {e}")
++        return False
++
++
+ async def _fire_operation(op_slug: str, project: dict, op: dict):
+     """Post a 'scheduled operation' message into the project's first channel.
+     The message itself uses /api/chat/send so the preset/project context
+@@ -3924,9 +4002,14 @@ async def _scheduler_loop():
+                         last_ts = float(state.get(key, 0))
+                         if now_ts - last_ts < period:
+                             continue
+-                        await _fire_operation(op_slug, pr, op)
+-                        state[key] = now_ts
+-                        fired_any = True
++                        if op_slug == "scheduler-nudge":
++                            did_fire = await _fire_scheduler_nudge(op_slug, pr, op, now_ts)
++                        else:
++                            await _fire_operation(op_slug, pr, op)
++                            did_fire = True
++                        if did_fire:
++                            state[key] = now_ts
++                            fired_any = True
+ 
+             if fired_any:
+                 _save_scheduler_state(state)

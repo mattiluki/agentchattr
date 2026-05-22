@@ -1,0 +1,600 @@
+diff --git a/ui-static/AgentOS.html b/ui-static/AgentOS.html
+index a80f276..613534e 100644
+--- a/ui-static/AgentOS.html
++++ b/ui-static/AgentOS.html
+@@ -804,17 +804,66 @@ html[data-theme="dark"] .tag-think { background: rgba(255,255,255,0.06); }
+   border-right: 1px solid var(--line);
+   overflow-y: auto;
+ }
++.inbox-select-all {
++  display: flex; align-items: center; gap: 8px;
++  padding: 8px 18px;
++  border-bottom: 1px solid var(--line);
++  background: var(--bg-sunken);
++  font-size: 11px; color: var(--ink-3);
++}
++.inbox-row-wrap {
++  border-bottom: 1px solid var(--line);
++  background: transparent;
++}
++.inbox-row-wrap:hover { background: var(--bg-sunken); }
+ .inbox-row {
+   display: flex; gap: 10px;
+   width: 100%;
+-  padding: 14px 18px;
++  padding: 0 12px 0 14px;
++  background: transparent; border: 0;
++  color: inherit; font: inherit;
++  align-items: stretch;
++}
++.inbox-row-main {
++  display: flex; gap: 10px; flex: 1;
++  padding: 14px 0;
+   background: transparent; border: 0;
+-  border-bottom: 1px solid var(--line);
+   text-align: left; cursor: pointer;
+   color: inherit; font: inherit;
+ }
+-.inbox-row:hover { background: var(--bg-sunken); }
+-.inbox-row-active { background: var(--bg-elev); border-left: 2px solid var(--accent); padding-left: 16px; }
++.inbox-row-check { align-self: center; flex-shrink: 0; }
++.inbox-diff-toggle {
++  align-self: center;
++  border: 1px solid var(--line);
++  border-radius: 5px;
++  background: var(--bg-elev);
++  color: var(--ink-3);
++  font-size: 10.5px;
++  padding: 3px 7px;
++  cursor: pointer;
++}
++.inbox-diff-toggle:hover { color: var(--accent); border-color: rgba(var(--accent-rgb),0.35); }
++.inbox-row-active { background: var(--bg-elev); border-left: 2px solid var(--accent); }
++.inbox-inline-diff { padding: 0 14px 12px 42px; }
++.inbox-inline-diff .diff-block {
++  margin: 0;
++  max-height: 220px;
++  overflow: auto;
++  white-space: pre-wrap;
++  word-break: break-word;
++}
++.inbox-bulk-bar {
++  position: fixed;
++  right: 22px;
++  bottom: 22px;
++  z-index: 10;
++  display: flex; align-items: center; gap: 8px;
++  padding: 10px 12px;
++  border: 1px solid var(--line-strong);
++  border-radius: 8px;
++  background: var(--bg-elev);
++  box-shadow: 0 12px 32px rgba(0,0,0,0.16);
++}
+ .urgency {
+   width: 3px; flex-shrink: 0;
+   border-radius: 2px;
+@@ -916,6 +965,52 @@ html[data-theme="dark"] .tag-think { background: rgba(255,255,255,0.06); }
+   color: var(--ink-3);
+ }
+ .empty-glyph { font-size: 36px; color: var(--muted-line); margin-bottom: 12px; }
++.empty-state {
++  padding: 48px 24px;
++  text-align: center;
++  color: var(--ink-3);
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  gap: 12px;
++  min-height: 150px;
++}
++.empty-state-icon {
++  width: 42px; height: 42px;
++  display: flex; align-items: center; justify-content: center;
++  border: 1px solid var(--line);
++  border-radius: 8px;
++  background: var(--bg-elev);
++  color: var(--muted);
++  font-size: 22px;
++}
++.empty-state-positive .empty-state-icon {
++  border-color: rgba(31,138,91,0.28);
++  background: rgba(31,138,91,0.08);
++  color: var(--ok);
++}
++.empty-state-copy { max-width: 420px; }
++.empty-state-headline { color: var(--ink); font-weight: 700; font-size: 14px; }
++.empty-state-context { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.45; }
++.empty-state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
++.empty-state-primary,
++.empty-state-secondary {
++  border-radius: 6px;
++  padding: 6px 12px;
++  cursor: pointer;
++  font-size: 11.5px;
++}
++.empty-state-primary {
++  border: 1px solid var(--accent);
++  background: var(--accent);
++  color: #fff;
++}
++.empty-state-secondary {
++  border: 1px solid var(--line-strong);
++  background: transparent;
++  color: var(--ink-2);
++}
+ 
+ /* ── Runs ────────────────────────────────────────────────────────────── */
+ .runs-header {
+@@ -3168,6 +3263,8 @@ html[data-theme="dark"] .filter-count { color: #0a0b0d; }
+ <script src="live-overlay.js"></script>
+ <script type="text/babel" src="tweaks-panel.jsx"></script>
+ <script type="text/babel" src="shared.jsx"></script>
++<script type="text/babel" src="screens/home.jsx"></script>
++<script type="text/babel" src="screens/empty-state.jsx"></script>
+ <script type="text/babel" src="screens/fleet.jsx"></script>
+ <script type="text/babel" src="screens/agent-edit.jsx"></script>
+ <script type="text/babel" src="screens/agent-detail.jsx"></script>
+diff --git a/ui-static/app.jsx b/ui-static/app.jsx
+index c52eb22..18be4c7 100644
+--- a/ui-static/app.jsx
++++ b/ui-static/app.jsx
+@@ -17,7 +17,7 @@ const ACCENT_RGBS = {
+ 
+ function App() {
+   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+-  const [screen, setScreen] = useState("fleet");
++  const [screen, setScreen] = useState("home");
+   const [selectedAgent, setSelectedAgent] = useState(null);
+   const [cmdkOpen, setCmdkOpen] = useState(false);
+   const vp = useViewport();
+@@ -42,6 +42,14 @@ function App() {
+   const selectAgent = (id) => { setSelectedAgent(id); setScreen("agent"); };
+   const navigate = (sc) => { setScreen(sc); setSelectedAgent(null); };
+ 
++  useEffect(() => {
++    const h = (e) => {
++      if (e.detail) navigate(e.detail);
++    };
++    window.addEventListener("agentos:navigate", h);
++    return () => window.removeEventListener("agentos:navigate", h);
++  }, []);
++
+   return (
+     <div className={"app" + (vp.isMobile ? " app-mobile" : "")}>
+       <TopBar onCmdK={() => setCmdkOpen(true)} isMobile={vp.isMobile} />
+@@ -49,6 +57,7 @@ function App() {
+       <div className="shell">
+         {!vp.isMobile && <Sidebar screen={screen} onNavigate={navigate} />}
+         <main className="main">
++          {screen === "home" && <HomeScreen onNavigate={navigate} />}
+           {screen === "fleet" && <FleetScreen onSelectAgent={selectAgent} density={t.density} />}
+           {screen === "agent" && <AgentDetailScreen agentId={selectedAgent} onBack={() => navigate("fleet")} />}
+           {screen === "inbox" && <InboxScreen />}
+@@ -139,6 +148,7 @@ function TopBar({ onCmdK, isMobile }) {
+ 
+ function BottomTabBar({ screen, onNavigate, onCmdK }) {
+   const tabs = [
++    { id: "home",      label: "Home",    glyph: "◈" },
+     { id: "fleet",     label: "Fleet",   glyph: "▦" },
+     { id: "inbox",     label: "Inbox",   glyph: "▤", badge: 5 },
+     { id: "cmdk",      label: "Search",  glyph: "⌕", action: onCmdK },
+@@ -179,6 +189,7 @@ function Ticker() {
+ 
+ function Sidebar({ screen, onNavigate }) {
+   const nav = [
++    { id: "home",      label: "Home",      glyph: "◈" },
+     { id: "fleet",     label: "Fleet",     glyph: "▦", count: 12 },
+     { id: "chat",      label: "Chat",      glyph: "◌" },
+     { id: "define",    label: "Define",    glyph: "✎" },   // skills · roles · operations · channels
+diff --git a/ui-static/screens/approvals.jsx b/ui-static/screens/approvals.jsx
+index 006e2fd..fb95c33 100644
+--- a/ui-static/screens/approvals.jsx
++++ b/ui-static/screens/approvals.jsx
+@@ -50,9 +50,12 @@ function ApprovalsScreen() {
+       </div>
+ 
+       {prompts.length === 0 && (
+-        <div className="muted" style={{padding:"60px 24px",textAlign:"center"}}>
+-          ✓ all agents are free — no pending permission prompts
+-        </div>
++        <EmptyState
++          icon="✓"
++          headline="No permission prompts waiting"
++          context="Agents are not blocked on terminal approvals right now."
++          tone="positive"
++        />
+       )}
+ 
+       <div style={{padding:"12px 20px",display:"flex",flexDirection:"column",gap:14}}>
+diff --git a/ui-static/screens/define.jsx b/ui-static/screens/define.jsx
+index 4397fd7..06c6758 100644
+--- a/ui-static/screens/define.jsx
++++ b/ui-static/screens/define.jsx
+@@ -1048,6 +1048,14 @@ function PerChannelInstancesPanel({ channel }) {
+         Caveat: instance can still post to other channels until wrapper.py
+         honors SCOPE_CHANNEL env. <b>~1× API cost per spawn.</b>
+       </div>
++      {instances.length === 0 && (
++        <EmptyState
++          icon="▦"
++          headline="No per-channel agent instances"
++          context={`Spawn an isolated agent for #${channel}, or define channel defaults before adding dedicated capacity.`}
++          primary={{ label: "Define → Channels", onClick: () => window.dispatchEvent(new CustomEvent("agentos:navigate", { detail: "define" })) }}
++        />
++      )}
+       <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+         {AGENTS.map(agent => (
+           <button key={agent}
+@@ -1724,9 +1732,20 @@ function ProjectTasks({ slug, agents, onCount }) {
+       </div>
+ 
+       {tasks.length === 0 && (
+-        <div className="muted mono" style={{fontSize:11,textAlign:"center",padding:"12px 0"}}>
+-          no tasks yet — add one above, or agents can POST to /api/projects/{slug}/tasks
+-        </div>
++        <EmptyState
++          icon="▤"
++          headline="No project tasks yet"
++          context={`Add one above, or agents can POST to /api/projects/${slug}/tasks.`}
++        />
++      )}
++
++      {tasks.length > 0 && openCount === 0 && (
++        <EmptyState
++          icon="✓"
++          headline="All project tasks are done"
++          context="Add the next task above when this project needs more work."
++          tone="positive"
++        />
+       )}
+ 
+       {grouped.map(g => g.items.length === 0 ? null : (
+@@ -1812,9 +1831,11 @@ function ProjectActivity({ slug, onCount }) {
+       </div>
+ 
+       {!collapsed && items.length === 0 && (
+-        <div className="muted mono" style={{fontSize:11,textAlign:"center",padding:"12px 0"}}>
+-          no activity yet
+-        </div>
++        <EmptyState
++          icon="◷"
++          headline="No project activity yet"
++          context="Tasks and chat from the project's channels will appear here once work starts."
++        />
+       )}
+ 
+       {!collapsed && items.map((e, i) => (
+diff --git a/ui-static/screens/fleet.jsx b/ui-static/screens/fleet.jsx
+index 0e4ca8b..9913c4e 100644
+--- a/ui-static/screens/fleet.jsx
++++ b/ui-static/screens/fleet.jsx
+@@ -546,9 +546,12 @@ function FleetScreen({ onSelectAgent, density }) {
+         </div>
+         {filtered.length === 0 && (
+           <div className="lib-empty">
+-            <div className="empty-glyph">∅</div>
+-            <div>No agents match</div>
+-            <button className="lib-filter-reset mono" onClick={reset}>clear filters</button>
++            <EmptyState
++              icon="⌕"
++              headline="No agents match"
++              context="Clear the current filters to return to the full fleet."
++              primary={{ label: "Clear filters", onClick: reset }}
++            />
+           </div>
+         )}
+         {filtered.map((a) => (
+diff --git a/ui-static/screens/generated.jsx b/ui-static/screens/generated.jsx
+index b32d1d0..76cfb39 100644
+--- a/ui-static/screens/generated.jsx
++++ b/ui-static/screens/generated.jsx
+@@ -118,7 +118,12 @@ function GeneratedScreen() {
+       {/* Grid */}
+       <div style={{padding:"12px 20px",overflowY:"auto",flex:1}}>
+         {items.length === 0 && (
+-          <div className="muted" style={{padding:"40px",textAlign:"center"}}>no generated media yet — use the prompt above</div>
++          <EmptyState
++            icon="▧"
++            headline="No generated media yet"
++            context="Media agents like @flux and @dalle write finished images and videos here."
++            primary={{ label: "Open chat", onClick: () => window.dispatchEvent(new CustomEvent("agentos:navigate", { detail: "chat" })) }}
++          />
+         )}
+         {Object.entries(grouped).map(([day, dayItems]) => (
+           <div key={day} style={{marginBottom:24}}>
+diff --git a/ui-static/screens/library.jsx b/ui-static/screens/library.jsx
+index 6415da8..53fe856 100644
+--- a/ui-static/screens/library.jsx
++++ b/ui-static/screens/library.jsx
+@@ -716,9 +716,12 @@ function TagsTab({ items, rerender, onSelectAgent }) {
+ function Empty({ onReset }) {
+   return (
+     <div className="lib-empty">
+-      <div className="empty-glyph">∅</div>
+-      <div>No matches</div>
+-      {onReset && <button className="lib-filter-reset mono" onClick={onReset}>reset filters</button>}
++      <EmptyState
++        icon="⌕"
++        headline="No library results"
++        context="Try a broader search or clear the active filters."
++        primary={onReset ? { label: "Clear filters", onClick: onReset } : null}
++      />
+     </div>
+   );
+ }
+diff --git a/ui-static/screens/other-screens.jsx b/ui-static/screens/other-screens.jsx
+index 7dd052e..f1288bb 100644
+--- a/ui-static/screens/other-screens.jsx
++++ b/ui-static/screens/other-screens.jsx
+@@ -10,13 +10,30 @@ function InboxScreen() {
+   const [search, setSearch] = useState("");
+   const [urgencyF, setUrgencyF] = useState([]);
+   const [riskF, setRiskF] = useState([]);
+-  const [agentF, setAgentF] = useState([]);
++  const savedFilters = (() => {
++    try { return JSON.parse(localStorage.getItem("inboxFilters") || "{}"); }
++    catch { return {}; }
++  })();
++  const [agentF, setAgentF] = useState(savedFilters.agentF || []);
++  const [kindF, setKindF] = useState(savedFilters.kindF || []);
++  const [projectF, setProjectF] = useState(savedFilters.projectF || []);
+   const [waitBand, setWaitBand] = useState(null);
++  const [sort, setSort] = useState(savedFilters.sort || "oldest");
+   const [showFilters, setShowFilters] = useState(false);
+-
+-  const urgencyCounts = {}; window.INBOX.forEach((i) => { urgencyCounts[i.urgency] = (urgencyCounts[i.urgency] || 0) + 1; });
+-  const riskCounts = {}; window.INBOX.forEach((i) => { riskCounts[i.risk] = (riskCounts[i.risk] || 0) + 1; });
+-  const agentCounts = {}; window.INBOX.forEach((i) => { agentCounts[i.agent] = (agentCounts[i.agent] || 0) + 1; });
++  const [selectedIds, setSelectedIds] = useState(new Set());
++  const [expandedId, setExpandedId] = useState(null);
++  const [bulkBusy, setBulkBusy] = useState(false);
++
++  const countBy = (key) => {
++    const counts = {};
++    items.forEach((i) => { const v = i[key] || "unknown"; counts[v] = (counts[v] || 0) + 1; });
++    return counts;
++  };
++  const urgencyCounts = countBy("urgency");
++  const riskCounts = countBy("risk");
++  const agentCounts = countBy("agent");
++  const kindCounts = countBy("kind");
++  const projectCounts = countBy("project");
+ 
+   const waitBands = {
+     "< 1m":  (w) => w === "now" || w.includes("s"),
+@@ -29,16 +46,38 @@ function InboxScreen() {
+     if (urgencyF.length) list = list.filter((i) => urgencyF.includes(i.urgency));
+     if (riskF.length)    list = list.filter((i) => riskF.includes(i.risk));
+     if (agentF.length)   list = list.filter((i) => agentF.includes(i.agent));
++    if (kindF.length)    list = list.filter((i) => kindF.includes(i.kind || "vault-write"));
++    if (projectF.length) list = list.filter((i) => projectF.includes(i.project || "unknown"));
+     if (waitBand)        list = list.filter((i) => waitBands[waitBand](i.waitTime));
+     if (search) {
+       const q = search.toLowerCase();
+-      list = list.filter((i) => i.title.toLowerCase().includes(q) || i.summary.toLowerCase().includes(q) || i.agent.includes(q));
++      list = list.filter((i) => i.title.toLowerCase().includes(q) || i.summary.toLowerCase().includes(q) || i.agent.includes(q) || (i.project || "").includes(q));
+     }
++    if (sort === "newest") list = [...list].reverse();
++    if (sort === "source") list = [...list].sort((a, b) => (a.agent || "").localeCompare(b.agent || "") || a.title.localeCompare(b.title));
++    if (sort === "project") list = [...list].sort((a, b) => (a.project || "").localeCompare(b.project || "") || a.title.localeCompare(b.title));
+     return list;
+-  }, [items, urgencyF, riskF, agentF, waitBand, search]);
++  }, [items, urgencyF, riskF, agentF, kindF, projectF, waitBand, search, sort]);
+ 
+-  const activeFilterCount = urgencyF.length + riskF.length + agentF.length + (waitBand ? 1 : 0);
+-  const reset = () => { setUrgencyF([]); setRiskF([]); setAgentF([]); setWaitBand(null); setSearch(""); };
++  useEffect(() => {
++    localStorage.setItem("inboxFilters", JSON.stringify({ kindF, projectF, agentF, sort }));
++  }, [kindF, projectF, agentF, sort]);
++
++  const activeFilterCount = urgencyF.length + riskF.length + agentF.length + kindF.length + projectF.length + (waitBand ? 1 : 0);
++  const reset = () => { setUrgencyF([]); setRiskF([]); setAgentF([]); setKindF([]); setProjectF([]); setWaitBand(null); setSearch(""); };
++  const visibleIds = filtered.map((i) => i.id);
++  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
++  const toggleSelected = (id) => setSelectedIds((cur) => {
++    const next = new Set(cur);
++    next.has(id) ? next.delete(id) : next.add(id);
++    return next;
++  });
++  const toggleVisible = () => setSelectedIds((cur) => {
++    const next = new Set(cur);
++    if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id));
++    else visibleIds.forEach((id) => next.add(id));
++    return next;
++  });
+ 
+   const decide = (id, action, payload) => {
+     // Polish: also POST to real HITL endpoints. Approve/reject hit
+@@ -50,6 +89,7 @@ function InboxScreen() {
+     const remaining = items.filter((x) => x.id !== id);
+     if (remaining.length) setSelected(remaining[0].id);
+     setEditingApproval(null);
++    setSelectedIds((cur) => { const next = new Set(cur); next.delete(id); return next; });
+     if (action === "approve" || action === "edit-approve") {
+       fetch(`/api/inbox/${encodeURIComponent(id)}/approve`, { method: "POST" })
+         .then(r => r.json())
+@@ -64,6 +104,35 @@ function InboxScreen() {
+     }
+   };
+ 
++  const bulkDecide = async (action) => {
++    const ids = Array.from(selectedIds).filter((id) => items.some((i) => i.id === id));
++    if (!ids.length) return;
++    const verb = action === "approve" ? "Approve" : "Reject";
++    const kinds = Array.from(new Set(ids.map((id) => items.find((i) => i.id === id)?.kind || "unknown"))).join(", ");
++    if (!confirm(`${verb} ${ids.length} selected proposal${ids.length > 1 ? "s" : ""}?\n\nKinds: ${kinds}`)) return;
++    setBulkBusy(true);
++    try {
++      const r = await fetch(`/api/inbox/bulk-${action}`, {
++        method: "POST",
++        headers: {"Content-Type": "application/json"},
++        body: JSON.stringify({ ids }),
++      });
++      const d = await r.json();
++      const done = (action === "approve" ? d.approved : d.rejected || []).map((x) => x.id);
++      setItems((arr) => arr.filter((x) => !done.includes(x.id)));
++      setSelectedIds((cur) => {
++        const next = new Set(cur);
++        done.forEach((id) => next.delete(id));
++        return next;
++      });
++      if (done.includes(selected)) setSelected(done.length < items.length ? items.find((i) => !done.includes(i.id))?.id : null);
++      if ((d.failed || []).length) alert(`${d.failed.length} failed; failed items stayed selected.`);
++    } catch (e) {
++      alert(`Bulk ${action} failed: ${String(e).slice(0, 120)}`);
++    }
++    setBulkBusy(false);
++  };
++
+   return (
+     <div className="screen inbox-screen">
+       {!(vp.isMobile && mobileShowDetail) && <div className="inbox-header">
+@@ -96,6 +165,10 @@ function InboxScreen() {
+ 
+           {showFilters && (
+             <div className="filter-panel filter-panel-inbox">
++              <FilterGroup label="kind" multi value={kindF} onChange={setKindF}
++                options={Object.keys(kindCounts).map((k) => ({ id: k, label: k, count: kindCounts[k] }))} />
++              <FilterGroup label="project" multi value={projectF} onChange={setProjectF}
++                options={Object.keys(projectCounts).map((k) => ({ id: k, label: k, count: projectCounts[k] }))} />
+               <FilterGroup label="urgency" multi value={urgencyF} onChange={setUrgencyF}
+                 options={Object.keys(urgencyCounts).map((k) => ({ id: k, label: k, count: urgencyCounts[k] }))} />
+               <FilterGroup label="risk" multi value={riskF} onChange={setRiskF}
+@@ -104,36 +177,68 @@ function InboxScreen() {
+                 options={Object.keys(agentCounts).map((k) => ({ id: k, label: k, count: agentCounts[k] }))} />
+               <FilterGroup label="waiting" value={waitBand} onChange={setWaitBand}
+                 options={Object.keys(waitBands).map((k) => ({ id: k, label: k }))} />
++              <div className="sort">
++                <span className="sort-lbl mono">sort</span>
++                <select value={sort} onChange={(e) => setSort(e.target.value)}>
++                  <option value="oldest">oldest first</option>
++                  <option value="newest">newest first</option>
++                  <option value="source">by source</option>
++                  <option value="project">by project</option>
++                </select>
++              </div>
+               {activeFilterCount > 0 && (
+                 <button className="lib-filter-reset mono" onClick={reset}>clear all</button>
+               )}
+             </div>
+           )}
++          {filtered.length > 0 && (
++            <label className="inbox-select-all mono">
++              <input type="checkbox" checked={allVisibleSelected} onChange={toggleVisible} />
++              <span>{allVisibleSelected ? "clear visible" : "select visible"} · {filtered.length}</span>
++            </label>
++          )}
+           {filtered.map((i) => (
+-            <button
+-              key={i.id}
+-              className={"inbox-row " + (selected === i.id && !vp.isMobile ? "inbox-row-active" : "")}
+-              onClick={() => { setSelected(i.id); if (vp.isMobile) setMobileShowDetail(true); }}
+-            >
+-              <span className={"urgency urgency-" + i.urgency} />
+-              <div className="inbox-row-body">
+-                <div className="inbox-row-meta mono">
+-                  <span>{i.agent}</span>
+-                  <span className="dot-sep">·</span>
+-                  <span>{i.id}</span>
+-                  <span className="inbox-wait">waiting {i.waitTime}</span>
+-                </div>
+-                <div className="inbox-row-title">{i.title}</div>
++            <div key={i.id} className={"inbox-row-wrap " + (selected === i.id && !vp.isMobile ? "inbox-row-active" : "")}>
++              <div className="inbox-row">
++                <input className="inbox-row-check" type="checkbox"
++                  checked={selectedIds.has(i.id)}
++                  onChange={() => toggleSelected(i.id)}
++                  onClick={(e) => e.stopPropagation()} />
++                <button className="inbox-row-main" onClick={() => { setSelected(i.id); if (vp.isMobile) setMobileShowDetail(true); }}>
++                  <span className={"urgency urgency-" + i.urgency} />
++                  <div className="inbox-row-body">
++                    <div className="inbox-row-meta mono">
++                      <span>{i.agent}</span>
++                      <span className="dot-sep">·</span>
++                      <span>{i.kind || "vault-write"}</span>
++                      <span className="dot-sep">·</span>
++                      <span>{i.project || "unknown"}</span>
++                      <span className="inbox-wait">waiting {i.waitTime}</span>
++                    </div>
++                    <div className="inbox-row-title">{i.title}</div>
++                  </div>
++                </button>
++                <button className="inbox-diff-toggle mono" onClick={() => setExpandedId(expandedId === i.id ? null : i.id)}>
++                  {expandedId === i.id ? "hide" : "diff"}
++                </button>
+               </div>
+-            </button>
++              {expandedId === i.id && (
++                <div className="inbox-inline-diff">
++                  <div className="inbox-section-h">inline proposal preview</div>
++                  <pre className="diff-block mono">{(i._meta && i._meta.body_preview) || i.summary || "No preview available."}</pre>
++                </div>
++              )}
++            </div>
+           ))}
+           {filtered.length === 0 && (
+             <div className="inbox-empty">
+-              <div className="empty-glyph">∅</div>
+-              <div>{items.length === 0 ? "Inbox zero." : "No matches."}</div>
+-              <div className="muted">{items.length === 0 ? "Nothing waiting on you." : (
+-                <button className="lib-filter-reset mono" onClick={reset}>clear filters</button>
+-              )}</div>
++              <EmptyState
++                icon={items.length === 0 ? "✓" : "⌕"}
++                headline={items.length === 0 ? "Inbox clear" : "No proposals match this filter"}
++                context={items.length === 0 ? "Nothing is waiting on your approval." : "Clear filters to return to the full approval queue."}
++                tone={items.length === 0 ? "positive" : "neutral"}
++                primary={items.length === 0 ? null : { label: "Clear filters", onClick: reset }}
++              />
+             </div>
+           )}
+         </div>
+@@ -238,6 +343,14 @@ function InboxScreen() {
+           onReject={() => decide(editingApproval.id, "reject")}
+         />
+       )}
++      {selectedIds.size > 0 && (
++        <div className="inbox-bulk-bar">
++          <span className="mono">{selectedIds.size} selected</span>
++          <button className="btn btn-primary" disabled={bulkBusy} onClick={() => bulkDecide("approve")}>Approve selected</button>
++          <button className="btn btn-ghost" disabled={bulkBusy} onClick={() => bulkDecide("reject")}>Reject selected</button>
++          <button className="btn btn-ghost" disabled={bulkBusy} onClick={() => setSelectedIds(new Set())}>Clear</button>
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/ui-static/screens/empty-state.jsx b/ui-static/screens/empty-state.jsx
+new file mode 100644
+index 0000000..3d1c34d
+--- /dev/null
++++ b/ui-static/screens/empty-state.jsx
+@@ -0,0 +1,27 @@
++function EmptyState({ icon = "∅", headline, context, primary, secondary, tone = "neutral" }) {
++  return (
++    <div className={"empty-state empty-state-" + tone}>
++      <div className="empty-state-icon" aria-hidden="true">{icon}</div>
++      <div className="empty-state-copy">
++        <div className="empty-state-headline">{headline}</div>
++        {context && <div className="empty-state-context">{context}</div>}
++      </div>
++      {(primary || secondary) && (
++        <div className="empty-state-actions">
++          {primary && (
++            <button className="empty-state-primary mono" onClick={primary.onClick}>
++              {primary.label}
++            </button>
++          )}
++          {secondary && (
++            <button className="empty-state-secondary mono" onClick={secondary.onClick}>
++              {secondary.label}
++            </button>
++          )}
++        </div>
++      )}
++    </div>
++  );
++}
++
++window.EmptyState = EmptyState;

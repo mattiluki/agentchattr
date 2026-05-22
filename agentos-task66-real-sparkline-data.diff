@@ -1,0 +1,335 @@
+diff --git a/serve.py b/serve.py
+index c9acb76..1c4f34c 100644
+--- a/serve.py
++++ b/serve.py
+@@ -120,6 +120,121 @@ _KNOWN_AGENTS = [
+ ]
+ _KNOWN_AGENT_SLUGS = {slug for slug, *_ in _KNOWN_AGENTS}
+ _FLEET_COST_CACHE = {"key": None, "ts": 0.0, "value": None}
++_FLEET_ACTIVITY_CACHE = {"ts": 0.0, "series": {}}
++
++
++def _normalize_agent_slug(sender: str | None) -> str:
++    slug = (sender or "").strip().lower()
++    if not slug:
++        return ""
++    base = re.sub(r"-\d+$", "", slug)
++    return base if base in _KNOWN_AGENT_SLUGS else ""
++
++
++def _parse_activity_ts(obj: dict) -> float | None:
++    raw = obj.get("timestamp") or obj.get("ts") or (obj.get("payload") or {}).get("timestamp")
++    if isinstance(raw, (int, float)):
++        return float(raw)
++    if isinstance(raw, str) and raw.strip():
++        import datetime as _dt
++        text = raw.strip().replace("Z", "+00:00")
++        try:
++            return _dt.datetime.fromisoformat(text).timestamp()
++        except Exception:
++            return None
++    return None
++
++
++def _activity_bucket(ts: float, now: float) -> int | None:
++    idx = int((now - ts) // 60)
++    return idx if 0 <= idx < 28 else None
++
++
++def _empty_activity_series() -> dict[str, list[int]]:
++    return {slug: [0] * 28 for slug, *_ in _KNOWN_AGENTS}
++
++
++def _add_activity(series: dict[str, list[int]], slug: str, ts: float | None, now: float, weight: int = 1):
++    if slug not in series or ts is None:
++        return
++    idx = _activity_bucket(ts, now)
++    if idx is not None:
++        series[slug][idx] += weight
++
++
++def _object_has_tool_activity(obj: dict) -> bool:
++    role = str(obj.get("role") or obj.get("type") or "").lower()
++    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
++    message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
++    keys = " ".join([role, str(payload.get("type") or ""), str(message.get("role") or "")]).lower()
++    if any(term in keys for term in ("tool", "function_call", "tool_use", "tool_result")):
++        return True
++    return any(k in obj or k in payload or k in message for k in ("tool_calls", "tool_call", "toolUse", "function_call"))
++
++
++def _collect_inspector_tool_activity(series: dict[str, list[int]], now: float):
++    import json as _json
++    for slug, root in (INSPECTOR_ROOTS.items() if "INSPECTOR_ROOTS" in globals() else []):
++        if not root.exists():
++            continue
++        patterns = ["**/chats/*.jsonl", "**/chats/*.json", "**/*.jsonl"] if slug == "gemini" else ["**/*.jsonl"]
++        files: list[Path] = []
++        for pat in patterns:
++            files.extend(root.glob(pat))
++        recent = sorted(
++            [p for p in files if p.is_file() and now - p.stat().st_mtime <= 35 * 60],
++            key=lambda p: p.stat().st_mtime,
++            reverse=True,
++        )[:8]
++        for path in recent:
++            try:
++                text = path.read_text(encoding="utf-8", errors="replace")
++            except Exception:
++                continue
++            for line in text.splitlines():
++                if not line.strip():
++                    continue
++                try:
++                    obj = _json.loads(line)
++                except Exception:
++                    continue
++                if _object_has_tool_activity(obj):
++                    _add_activity(series, slug, _parse_activity_ts(obj), now)
++
++
++def _compute_fleet_activity(force: bool = False) -> dict[str, list[int]]:
++    import json as _json
++    now = time.time()
++    if not force and now - float(_FLEET_ACTIVITY_CACHE.get("ts") or 0) < 30:
++        return _FLEET_ACTIVITY_CACHE.get("series") or _empty_activity_series()
++
++    series = _empty_activity_series()
++    log_path = AGENTCHATTR_DATA / "agentchattr_log.jsonl"
++    if log_path.exists():
++        try:
++            for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
++                if not line.strip():
++                    continue
++                try:
++                    obj = _json.loads(line)
++                except Exception:
++                    continue
++                slug = _normalize_agent_slug(obj.get("sender"))
++                _add_activity(series, slug, _parse_activity_ts(obj), now)
++        except Exception as e:
++            log.warning(f"fleet activity chat parse failed: {e}")
++
++    try:
++        _collect_inspector_tool_activity(series, now)
++    except Exception as e:
++        log.warning(f"fleet activity tool parse failed: {e}")
++
++    _FLEET_ACTIVITY_CACHE.update({"ts": now, "series": series})
++    return series
++
++
++def _sparkline_for(slug: str) -> list[int]:
++    return list((_compute_fleet_activity().get(slug) or [0] * 28)[:28])
+ 
+ 
+ def _ps_running_wrappers() -> set[str]:
+@@ -729,8 +844,18 @@ async def runs(limit: int = 50) -> list[dict]:
+     return out[:limit]
+ 
+ 
++def _inbox_kind(operation: str, target_path: str) -> str:
++    if operation == "env_patch" or target_path.endswith(".env"):
++        return "env-change"
++    if target_path.startswith("04-Wiki/patches/") or target_path.endswith(".diff"):
++        return "repo-patch"
++    if "Lab/Projects/" in target_path or target_path.endswith("agentos-roadmap.md"):
++        return "project-change"
++    return "vault-write"
++
++
+ @app.get("/api/inbox")
+-async def inbox() -> list[dict]:
++async def inbox(kind: str | None = None, agent: str | None = None, project: str | None = None) -> list[dict]:
+     """List pending HITL proposals from 00-Inbox/Outgoing/. Shape matches
+     what the prototype's Inbox screen expects (id, agent, title, summary,
+     urgency, waitTime, risk, impact)."""
+@@ -768,6 +893,14 @@ async def inbox() -> list[dict]:
+         target_path = fm.get("target_path", "?")
+         operation = fm.get("operation", "create")
+         agent_id = fm.get("agent_id", "unknown")
++        item_kind = _inbox_kind(operation, target_path)
++        item_project = fm.get("project") or ("agentos-roadmap" if "agentos" in target_path.lower() else "")
++        if kind and item_kind != kind:
++            continue
++        if agent and agent_id != agent:
++            continue
++        if project and item_project != project:
++            continue
+         rationale = fm.get("rationale", "")
+         age_s = int(now - f.stat().st_mtime)
+         wait = f"{age_s}s" if age_s < 60 else f"{age_s // 60}m" if age_s < 3600 else f"{age_s // 3600}h"
+@@ -833,6 +966,8 @@ async def inbox() -> list[dict]:
+             "waitTime": wait,
+             "risk": risk_map.get(operation, "reversible"),
+             "impact": target_path,
++            "kind": item_kind,
++            "project": item_project,
+             "related_plan": related_plan,
+             "related_reviews": related_reviews,
+             "review_summary": review_summary,
+@@ -841,6 +976,8 @@ async def inbox() -> list[dict]:
+                 "filepath": str(f),
+                 "target_path": target_path,
+                 "operation": operation,
++                "kind": item_kind,
++                "project": item_project,
+                 "agent_id": agent_id,
+                 "rationale": rationale,
+                 "body_preview": body[:400],
+@@ -850,6 +987,32 @@ async def inbox() -> list[dict]:
+     return out
+ 
+ 
++@app.post("/api/inbox/bulk-approve")
++async def inbox_bulk_approve(payload: dict):
++    approved = []
++    failed = []
++    for proposal_id in payload.get("ids") or []:
++        result = await inbox_approve(str(proposal_id))
++        if isinstance(result, dict) and result.get("error"):
++            failed.append({"id": proposal_id, "error": result.get("error")})
++        else:
++            approved.append({"id": proposal_id, "result": result})
++    return {"ok": len(failed) == 0, "approved": approved, "failed": failed}
++
++
++@app.post("/api/inbox/bulk-reject")
++async def inbox_bulk_reject(payload: dict):
++    rejected = []
++    failed = []
++    for proposal_id in payload.get("ids") or []:
++        result = await inbox_reject(str(proposal_id))
++        if isinstance(result, dict) and result.get("error"):
++            failed.append({"id": proposal_id, "error": result.get("error")})
++        else:
++            rejected.append({"id": proposal_id, "result": result})
++    return {"ok": len(failed) == 0, "rejected": rejected, "failed": failed}
++
++
+ @app.post("/api/inbox/{proposal_id}/approve")
+ async def inbox_approve(proposal_id: str):
+     """Approve a HITL proposal by moving the file from Outgoing/ to its
+@@ -3180,7 +3343,7 @@ async def fleet() -> list[dict]:
+             "lastAction": "now" if is_running else "—",
+             "region": "mac-mini",
+             "uptimeHrs": 0,
+-            "sparkline": [0] * 28,
++            "sparkline": _sparkline_for(slug),
+             "role": roles.get(slug),  # Stage 4: e.g. "Planner" / "Builder" / "Reviewer"
+             "_meta": {"color": color, "vault_mcp": has_vault, "command": cmd},
+         })
+@@ -3978,6 +4141,7 @@ async def _scheduler_loop():
+     log.info("scheduler: started")
+     while True:
+         try:
++            _compute_fleet_activity(force=True)
+             state = _load_scheduler_state()
+             now = _dt.datetime.now()
+             now_ts = now.timestamp()
+@@ -5806,6 +5970,105 @@ async def scheduler_status():
+     return {"now": _dt.datetime.now().isoformat(timespec="seconds"), "entries": out}
+ 
+ 
++@app.get("/api/home")
++async def home_payload():
++    """One-shot Home dashboard payload composed from existing read endpoints."""
++    import json as _json
++    import time as _t
++    from pathlib import Path as _Path
++
++    project_slug = "agentos-roadmap"
++    project = _read_vault_page(PROJECTS_DIR, project_slug, PROJECT_EXTRA_FIELDS) or {}
++    wf = project.get("workflow") or {}
++    active_task_id = wf.get("active_task_id")
++    active_task = next((t for t in (project.get("tasks") or []) if t.get("id") == active_task_id), None)
++    active_phase = _phase_by_name(wf, wf.get("active_phase"))
++    events = _read_phase_events(50, project_slug)
++
++    active_focus = {
++        "project": project_slug,
++        "task_id": active_task_id,
++        "task_title": (active_task or {}).get("title"),
++        "phase": wf.get("active_phase"),
++        "phase_state": wf.get("phase_state") or "idle",
++        "agent": active_phase.get("agent") or wf.get("coordinator_agent"),
++        "last_pulse_iso": next((e.get("ts") for e in events if e.get("task_id") == active_task_id), None),
++    }
++
++    recent_commits = []
++    for ev in events:
++        for item in ev.get("commits") or []:
++            repo = item.get("repo") or ""
++            recent_commits.append({
++                "project": ev.get("project"),
++                "task_id": ev.get("task_id"),
++                "phase": ev.get("phase"),
++                "sha": item.get("sha") or item.get("commit"),
++                "repo": _Path(repo).name if repo else "",
++                "repo_path": repo,
++                "ts": ev.get("ts"),
++                "summary": ev.get("summary"),
++            })
++    recent_commits = recent_commits[:10]
++
++    try:
++        pending_hitl = sorted(await inbox(), key=lambda i: i.get("waitTime") or "")[:5]
++    except Exception:
++        pending_hitl = []
++
++    chat_recent = []
++    for channel in (project.get("channels") or ["general"])[:2]:
++        status, body = _proxy_agentchattr_get("/api/messages", {"channel": channel, "limit": 5})
++        if status != 200:
++            continue
++        try:
++            for msg in _json.loads(body):
++                text = (msg.get("text") or "").strip().replace("\n", " ")
++                ts = msg.get("time") or (
++                    _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(msg.get("timestamp", 0)))
++                    if msg.get("timestamp") else ""
++                )
++                chat_recent.append({
++                    "channel": channel,
++                    "sender": msg.get("sender"),
++                    "ts": ts,
++                    "preview": text[:180],
++                })
++        except Exception:
++            continue
++    chat_recent = chat_recent[-5:][::-1]
++
++    try:
++        scheduler = await scheduler_status()
++        scheduler_next = (scheduler.get("entries") or [])[:3]
++    except Exception:
++        scheduler_next = []
++
++    try:
++        fleet_rows = await fleet()
++    except Exception:
++        fleet_rows = []
++    fleet_summary = {
++        "alive": len([a for a in fleet_rows if a.get("status") == "running"]),
++        "idle": len([a for a in fleet_rows if a.get("status") == "idle"]),
++        "blocked": len([a for a in fleet_rows if a.get("status") == "error"]),
++        "agents": [{
++            "slug": a.get("name"),
++            "state": a.get("status"),
++            "color": ((a.get("_meta") or {}).get("color") or "#8a8178"),
++        } for a in fleet_rows],
++    }
++
++    return {
++        "active_focus": active_focus,
++        "recent_commits": recent_commits,
++        "pending_hitl": pending_hitl,
++        "chat_recent": chat_recent,
++        "scheduler_next": scheduler_next,
++        "fleet": fleet_summary,
++    }
++
++
+ # Static file serving — mount LAST so all explicit /api/* routes register first.
+ app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="static")
+ 
