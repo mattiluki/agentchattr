@@ -1,0 +1,583 @@
+diff --git a/agents/orchestrator.py b/agents/orchestrator.py
+index 0464153..cb52662 100644
+--- a/agents/orchestrator.py
++++ b/agents/orchestrator.py
+@@ -107,6 +107,14 @@ def update_project_workflow(slug: str, workflow: dict, retries: int = 1) -> bool
+         time.sleep(0.5)
+ 
+ 
++def auto_approve_project_phase(slug: str, task_id: int, phase: str, expected_artifact: str = "") -> dict | None:
++    return _http("POST", f"/api/projects/{slug}/phases/auto-approve", {
++        "task_id": task_id,
++        "phase": phase,
++        "expected_artifact": expected_artifact,
++    })
++
++
+ def post_chat(channel: str, text: str) -> bool:
+     r = _http("POST", "/api/chat/send", {
+         "channel": channel, "sender": "orchestrator", "text": text,
+@@ -191,28 +199,33 @@ def pulse_once():
+     if phase_state == "pending_user_approval":
+         log.info(f"task #{task['id']} phase {workflow.get('active_phase')!r} pending user approval — skipping pulse")
+         return
++    if phase_state == "paused_for_review":
++        log.info(f"task #{task['id']} phase {workflow.get('active_phase')!r} paused for review — skipping pulse")
++        return
+ 
+     if not current_phase:
+         # All phase outputs detected → Coordinator auto-finalizes (commit + mark done)
+         last_phase = phases[-1]
+         auto_approve = workflow.get("coordinator_auto_approve", True)
+         coordinator = workflow.get("coordinator_agent", "claude")
+-        workflow["active_task_id"] = task["id"]
+-        workflow["active_phase"] = last_phase.get("name")
+-        workflow["phase_state"] = "pending_user_approval"
+-        workflow["pending_review_path"] = last_phase.get("output_hint", "").replace("<task-slug>", task_slug)
+-        if not update_project_workflow(PROJECT_SLUG, workflow):
+-            log.warning(f"final-finalize PUT failed for task #{task['id']} — next pulse will retry")
+-            return
++        last_phase_name = last_phase.get("name")
++        review_path = last_phase.get("output_hint", "").replace("<task-slug>", task_slug)
+ 
+         if not auto_approve:
++            workflow["active_task_id"] = task["id"]
++            workflow["active_phase"] = last_phase_name
++            workflow["phase_state"] = "pending_user_approval"
++            workflow["pending_review_path"] = review_path
++            if not update_project_workflow(PROJECT_SLUG, workflow):
++                log.warning(f"final-finalize PUT failed for task #{task['id']} — next pulse will retry")
++                return
+             post_chat(channel,
+                 f"@user · gate: ALL phases done on task #{task['id']}. "
+                 f"Approve in Define → Projects → {PROJECT_SLUG} to finalize.")
+             return
+ 
+         log.info(f"all phases done on task #{task['id']} — coordinator auto-commits + closes")
+-        result = _http("POST", f"/api/projects/{PROJECT_SLUG}/phases/approve")
++        result = auto_approve_project_phase(PROJECT_SLUG, task["id"], last_phase_name, review_path)
+         if result and result.get("ok"):
+             commits = result.get("commits", [])
+             cs = "\n".join("  ✓ " + c["repo"].split("/")[-1] + ": " + (c.get("commit","") or c.get("skipped","") or "?") for c in commits)
+@@ -247,17 +260,8 @@ def pulse_once():
+             return
+ 
+         # AUTO-APPROVE PATH: coordinator commits + advances by itself
+-        # Move to pending_user_approval briefly so the approve endpoint accepts it
+-        workflow["phase_state"] = "pending_user_approval"
+-        workflow["pending_review_path"] = prev_phase.get("output_hint", "").replace("<task-slug>", task_slug)
+-        if not update_project_workflow(PROJECT_SLUG, workflow):
+-            log.warning(
+-                f"auto-approve PUT failed for phase {prev_phase.get('name')!r} task #{task['id']} — "
+-                f"workflow still in 'working' state; next pulse will retry"
+-            )
+-            return
+-        # Call approve endpoint internally (same logic as user-click)
+-        result = _http("POST", f"/api/projects/{PROJECT_SLUG}/phases/approve")
++        review_path = prev_phase.get("output_hint", "").replace("<task-slug>", task_slug)
++        result = auto_approve_project_phase(PROJECT_SLUG, task["id"], prev_phase.get("name"), review_path)
+         if result and result.get("ok"):
+             commits = result.get("commits", [])
+             commit_summary = "\n".join(
+diff --git a/serve.py b/serve.py
+index 758d531..b43a3f4 100644
+--- a/serve.py
++++ b/serve.py
+@@ -12,6 +12,7 @@ Stage 3+ planned:    WebSocket /ws/agents/{id} via tmux capture-pane;
+                      /api/inbox approve/reject via filesystem moves
+ """
+ 
++import asyncio
+ import logging
+ import re
+ import subprocess
+@@ -1967,6 +1968,165 @@ def _record_phase_event(kind: str, slug: str, wf: dict, task_id, phase: str | No
+ 
+ 
+ _WORKFLOWS_CACHE = {"ts": 0.0, "mtime_key": None, "rows": []}
++_PROJECT_PHASE_LOCKS: dict[str, asyncio.Lock] = {}
++
++
++def _phase_lock_for(slug: str) -> asyncio.Lock:
++    lock = _PROJECT_PHASE_LOCKS.get(slug)
++    if lock is None:
++        lock = asyncio.Lock()
++        _PROJECT_PHASE_LOCKS[slug] = lock
++    return lock
++
++
++def _vault_relative_exists(rel_path: str) -> bool:
++    if not rel_path:
++        return True
++    try:
++        target = (VAULT / rel_path).resolve()
++        vault_root = VAULT.resolve()
++        if target != vault_root and vault_root not in target.parents:
++            return False
++        return target.exists()
++    except Exception:
++        return False
++
++
++def _reset_blocked_pause_counters(wf: dict):
++    wf["consecutive_blocked_count"] = 0
++    wf["last_blocked_reasons"] = []
++    wf.pop("pause_reason", None)
++
++
++def _commit_phase_repos(slug: str, wf: dict, task_id, phase: str | None) -> list[dict]:
++    import datetime as _dt
++
++    repos = wf.get("repos_to_commit") or []
++    do_push = wf.get("auto_push", True)
++    commit_msg = (
++        f"feat({slug}): phase {phase} done · task #{task_id}\n\n"
++        f"Auto-committed by AgentOS coordinator after user approval at "
++        f"{_dt.datetime.now().isoformat(timespec='seconds')}.\n\n"
++        f"🤖 Generated with [Claude Code](https://claude.com/claude-code)"
++    )
++
++    results = []
++    for repo in repos:
++        repo_path = Path(repo)
++        if not (repo_path / ".git").exists():
++            results.append({"repo": repo, "skipped": "not a git repo"})
++            continue
++        try:
++            subprocess.run(["/usr/bin/git", "-C", repo, "add", "-A"], check=True, capture_output=True, timeout=10)
++            status = subprocess.run(["/usr/bin/git", "-C", repo, "status", "--porcelain"],
++                                    capture_output=True, text=True, timeout=5).stdout
++            if not status.strip():
++                results.append({"repo": repo, "skipped": "no changes"})
++                continue
++            subprocess.run(["/usr/bin/git", "-C", repo, "commit", "-m", commit_msg],
++                           check=True, capture_output=True, timeout=15)
++            commit_sha = subprocess.run(["/usr/bin/git", "-C", repo, "rev-parse", "HEAD"],
++                                        capture_output=True, text=True, timeout=5).stdout.strip()[:8]
++            push_result = "skipped (no remote or auto_push=false)"
++            if do_push:
++                remote = subprocess.run(["/usr/bin/git", "-C", repo, "remote"],
++                                        capture_output=True, text=True, timeout=3).stdout.strip()
++                if remote:
++                    try:
++                        subprocess.run(["/usr/bin/git", "-C", repo, "push"],
++                                       check=True, capture_output=True, timeout=60)
++                        push_result = "pushed"
++                    except subprocess.CalledProcessError as e:
++                        push_result = f"push failed: {e.stderr.decode()[:100] if e.stderr else 'error'}"
++            results.append({"repo": repo, "commit": commit_sha, "sha": commit_sha, "push": push_result})
++        except subprocess.CalledProcessError as e:
++            results.append({"repo": repo, "error": e.stderr.decode()[:200] if e.stderr else "git failed"})
++        except Exception as e:
++            results.append({"repo": repo, "error": str(e)[:200]})
++    return results
++
++
++def _finish_approved_phase(slug: str, pr: dict, fm: dict, wf: dict, *, write_before_commit: bool = False) -> dict:
++    task_id = wf.get("active_task_id")
++    phase = wf.get("active_phase")
++    current_phase = _phase_by_name(wf, phase)
++    body = pr.get("body") or ""
++
++    if write_before_commit:
++        if current_phase.get("pause_after") is True:
++            wf["phase_state"] = "paused_for_review"
++            msg = f"phase {phase!r} paused for HITL review"
++        else:
++            msg = _advance_workflow_phase(pr, fm, wf, task_id)
++        if wf.get("phase_state") != "paused_for_review":
++            wf.pop("pending_review_path", None)
++        fm["workflow"] = wf
++        _write_vault_page(PROJECTS_DIR, slug, fm, body)
++
++    results = _commit_phase_repos(slug, wf, task_id, phase)
++    commit_refs = _normalize_commit_results(results)
++    approved_event = _record_phase_event(
++        "phase-approved",
++        slug,
++        wf,
++        task_id,
++        phase,
++        f"approved phase {phase!r} for task #{task_id}",
++        {"commits": commit_refs},
++    )
++
++    if not write_before_commit:
++        if current_phase.get("pause_after") is True:
++            wf["phase_state"] = "paused_for_review"
++            msg = f"phase {phase!r} paused for HITL review"
++            event = _record_phase_event("phase-paused", slug, wf, task_id, phase, msg)
++        else:
++            msg = _advance_workflow_phase(pr, fm, wf, task_id)
++            event = approved_event
++        if wf.get("phase_state") != "paused_for_review":
++            wf.pop("pending_review_path", None)
++        fm["workflow"] = wf
++        _write_vault_page(PROJECTS_DIR, slug, fm, body)
++    else:
++        event = approved_event
++        if current_phase.get("pause_after") is True:
++            event = _record_phase_event("phase-paused", slug, wf, task_id, phase, msg)
++
++    return {
++        "ok": True,
++        "approved_phase": phase,
++        "task_id": task_id,
++        "commits": results,
++        "paused": wf.get("phase_state") == "paused_for_review",
++        "event": event,
++        "next": msg,
++    }
++
++
++async def _approve_current_phase(slug: str, *, write_before_commit: bool = False,
++                                 pr: dict | None = None, fm: dict | None = None,
++                                 wf: dict | None = None) -> dict:
++    if pr is None:
++        pr = _read_vault_page(PROJECTS_DIR, slug, PROJECT_EXTRA_FIELDS)
++    if not pr:
++        return {"error": "project not found"}
++    if fm is None:
++        fm = dict(pr["_frontmatter"])
++    if wf is None:
++        wf = fm.get("workflow") or {}
++    if wf.get("phase_state") != "pending_user_approval":
++        return {"error": f"no phase pending approval (state={wf.get('phase_state')!r})"}
++
++    result = _finish_approved_phase(slug, pr, fm, wf, write_before_commit=write_before_commit)
++    if result.get("paused"):
++        channels = pr.get("channels") or []
++        if channels:
++            await _post_system_notice(
++                channels[0],
++                f"Phase {result.get('approved_phase')} paused for HITL review — "
++                f"confirm to continue task #{result.get('task_id')}.",
++            )
++    return result
+ 
+ 
+ def _read_phase_events(limit: int = 20, project_slug: str | None = None) -> list[dict]:
+@@ -2066,6 +2226,9 @@ def _workflow_rows() -> list[dict]:
+                 "phase_state": wf.get("phase_state"),
+                 "coordinator_auto_approve": wf.get("coordinator_auto_approve"),
+                 "pending_review_path": wf.get("pending_review_path"),
++                "pause_reason": wf.get("pause_reason"),
++                "consecutive_blocked_count": wf.get("consecutive_blocked_count") or 0,
++                "last_blocked_reasons": wf.get("last_blocked_reasons") or [],
+             },
+             "events": events,
+             "recent_phase_events": events,
+@@ -2137,7 +2300,10 @@ async def project_put(slug: str, payload: dict):
+     existing_tasks = (existing or {}).get("tasks") or []
+     tasks = payload.get("tasks", existing_tasks)
+     # Preserve workflow from existing or accept new one (orchestrator writes here)
++    existing_workflow = (existing or {}).get("workflow") or {}
+     workflow = payload.get("workflow", (existing or {}).get("workflow"))
++    if isinstance(workflow, dict) and workflow.get("active_task_id") != existing_workflow.get("active_task_id"):
++        _reset_blocked_pause_counters(workflow)
+     fm = {
+         "type": "project",
+         "slug": slug,
+@@ -2180,6 +2346,9 @@ async def project_phases_pending(slug: str):
+         "phase": wf.get("active_phase"),
+         "coordinator_agent": wf.get("coordinator_agent"),
+         "review_path": wf.get("pending_review_path"),
++        "pause_reason": wf.get("pause_reason"),
++        "consecutive_blocked_count": wf.get("consecutive_blocked_count") or 0,
++        "last_blocked_reasons": wf.get("last_blocked_reasons") or [],
+     }
+ 
+ 
+@@ -2190,104 +2359,78 @@ async def project_phase_approve(slug: str):
+       2. Push to remote where one exists
+       3. Advance workflow to next phase (orchestrator picks it up)
+     """
+-    import subprocess as _sp
+-    import datetime as _dt
+-    pr = _read_vault_page(PROJECTS_DIR, slug, PROJECT_EXTRA_FIELDS)
+-    if not pr:
+-        return {"error": "project not found"}
+-    fm = dict(pr["_frontmatter"])
+-    wf = fm.get("workflow") or {}
+-    if wf.get("phase_state") != "pending_user_approval":
+-        return {"error": f"no phase pending approval (state={wf.get('phase_state')!r})"}
++    return await _approve_current_phase(slug)
+ 
+-    task_id = wf.get("active_task_id")
+-    phase   = wf.get("active_phase")
+-    repos   = wf.get("repos_to_commit") or []
+-    do_push = wf.get("auto_push", True)
+-    commit_msg = (
+-        f"feat({slug}): phase {phase} done · task #{task_id}\n\n"
+-        f"Auto-committed by AgentOS coordinator after user approval at "
+-        f"{_dt.datetime.now().isoformat(timespec='seconds')}.\n\n"
+-        f"🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+-    )
+ 
+-    results = []
+-    for repo in repos:
+-        repo_path = Path(repo)
+-        if not (repo_path / ".git").exists():
+-            results.append({"repo": repo, "skipped": "not a git repo"})
+-            continue
+-        # stage all
+-        try:
+-            _sp.run(["/usr/bin/git", "-C", repo, "add", "-A"], check=True, capture_output=True, timeout=10)
+-            status = _sp.run(["/usr/bin/git", "-C", repo, "status", "--porcelain"],
+-                             capture_output=True, text=True, timeout=5).stdout
+-            if not status.strip():
+-                results.append({"repo": repo, "skipped": "no changes"})
+-                continue
+-            _sp.run(["/usr/bin/git", "-C", repo, "commit", "-m", commit_msg],
+-                    check=True, capture_output=True, timeout=15)
+-            commit_sha = _sp.run(["/usr/bin/git", "-C", repo, "rev-parse", "HEAD"],
+-                                 capture_output=True, text=True, timeout=5).stdout.strip()[:8]
+-            # push if remote exists + auto_push
+-            push_result = "skipped (no remote or auto_push=false)"
+-            if do_push:
+-                remote = _sp.run(["/usr/bin/git", "-C", repo, "remote"],
+-                                 capture_output=True, text=True, timeout=3).stdout.strip()
+-                if remote:
+-                    try:
+-                        _sp.run(["/usr/bin/git", "-C", repo, "push"],
+-                                check=True, capture_output=True, timeout=60)
+-                        push_result = "pushed"
+-                    except _sp.CalledProcessError as e:
+-                        push_result = f"push failed: {e.stderr.decode()[:100] if e.stderr else 'error'}"
+-            results.append({"repo": repo, "commit": commit_sha, "sha": commit_sha, "push": push_result})
+-        except _sp.CalledProcessError as e:
+-            results.append({"repo": repo, "error": e.stderr.decode()[:200] if e.stderr else "git failed"})
+-        except Exception as e:
+-            results.append({"repo": repo, "error": str(e)[:200]})
++@app.post("/api/projects/{slug}/phases/auto-approve")
++async def project_phase_auto_approve(slug: str, payload: dict):
++    """Coordinator-only atomic approval path.
+ 
+-    current_phase = _phase_by_name(wf, phase)
+-    commit_refs = _normalize_commit_results(results)
+-    approved_event = _record_phase_event(
+-        "phase-approved",
+-        slug,
+-        wf,
+-        task_id,
+-        phase,
+-        f"approved phase {phase!r} for task #{task_id}",
+-        {"commits": commit_refs},
+-    )
+-    if current_phase.get("pause_after") is True:
+-        wf["phase_state"] = "paused_for_review"
+-        msg = f"phase {phase!r} paused for HITL review"
+-        event = _record_phase_event("phase-paused", slug, wf, task_id, phase, msg)
+-    else:
+-        msg = _advance_workflow_phase(pr, fm, wf, task_id)
+-        event = approved_event
++    The orchestrator supplies the task and phase it believes just completed.
++    The server validates the live project state under a project lock, writes
++    the advanced workflow frontmatter, then commits repo changes.
++    """
++    task_id = payload.get("task_id")
++    phase = payload.get("phase")
++    expected_artifact = (payload.get("expected_artifact") or "").strip()
++    if task_id is None or not phase:
++        return JSONResponse({"error": "task_id and phase required"}, status_code=400)
+ 
+-    if wf.get("phase_state") != "paused_for_review":
+-        wf.pop("pending_review_path", None)
+-    fm["workflow"] = wf
+-    body = pr.get("body") or ""
+-    _write_vault_page(PROJECTS_DIR, slug, fm, body)
+-    if current_phase.get("pause_after") is True:
+-        channels = pr.get("channels") or []
+-        if channels:
+-            await _post_system_notice(
+-                channels[0],
+-                f"Phase {phase} paused for HITL review — confirm to continue task #{task_id}.",
+-            )
++    lock = _phase_lock_for(slug)
++    try:
++        await asyncio.wait_for(lock.acquire(), timeout=30)
++    except asyncio.TimeoutError:
++        return JSONResponse({"error": "phase approval lock timeout"}, status_code=423)
+ 
+-    return {
+-        "ok": True,
+-        "approved_phase": phase,
+-        "task_id": task_id,
+-        "commits": results,
+-        "paused": wf.get("phase_state") == "paused_for_review",
+-        "event": event,
+-        "next": msg,
+-    }
++    try:
++        pr = _read_vault_page(PROJECTS_DIR, slug, PROJECT_EXTRA_FIELDS)
++        if not pr:
++            return JSONResponse({"error": "project not found"}, status_code=404)
++        fm = dict(pr["_frontmatter"])
++        wf = fm.get("workflow") or {}
++        active_task_id = wf.get("active_task_id")
++        active_phase = wf.get("active_phase")
++        phase_state = wf.get("phase_state")
++
++        if active_task_id != task_id or active_phase != phase:
++            return {
++                "ok": True,
++                "already_advanced": True,
++                "task_id": task_id,
++                "approved_phase": phase,
++                "current_task_id": active_task_id,
++                "current_phase": active_phase,
++                "phase_state": phase_state,
++            }
++
++        if phase_state not in ("working", "pending_user_approval"):
++            return JSONResponse({
++                "error": f"phase not approvable (state={phase_state!r})",
++                "task_id": task_id,
++                "phase": phase,
++            }, status_code=409)
++
++        if expected_artifact and not _vault_relative_exists(expected_artifact):
++            return JSONResponse({
++                "error": "expected artifact missing",
++                "expected_artifact": expected_artifact,
++            }, status_code=409)
++
++        wf["phase_state"] = "pending_user_approval"
++        if expected_artifact:
++            wf["pending_review_path"] = expected_artifact
++
++        result = await _approve_current_phase(
++            slug,
++            write_before_commit=True,
++            pr=pr,
++            fm=fm,
++            wf=wf,
++        )
++        result["already_advanced"] = False
++        return result
++    finally:
++        lock.release()
+ 
+ 
+ @app.get("/api/projects/{slug}/phase-events")
+@@ -2411,9 +2554,7 @@ async def project_phase_request_changes(slug: str, payload: dict):
+     return {"ok": True, "phase": wf.get("active_phase"), "feedback": payload.get("notes")}
+ 
+ 
+-@app.post("/api/projects/{slug}/tasks/{task_id}/resume")
+-async def project_task_resume(slug: str, task_id: int):
+-    """Resume a workflow paused by workflow.phases[].pause_after."""
++def _resume_paused_workflow(slug: str, task_id: int):
+     pr = _read_vault_page(PROJECTS_DIR, slug, PROJECT_EXTRA_FIELDS)
+     if not pr:
+         return {"error": "project not found"}
+@@ -2427,12 +2568,32 @@ async def project_task_resume(slug: str, task_id: int):
+     phase = wf.get("active_phase")
+     msg = _advance_workflow_phase(pr, fm, wf, task_id)
+     wf.pop("pending_review_path", None)
++    _reset_blocked_pause_counters(wf)
+     fm["workflow"] = wf
+     _write_vault_page(PROJECTS_DIR, slug, fm, pr.get("body") or "")
+     event = _record_phase_event("phase-resumed", slug, wf, task_id, phase, f"resumed task #{task_id} after phase {phase}", {"next": msg})
+     return {"ok": True, "resumed_phase": phase, "task_id": task_id, "event": event, "next": msg}
+ 
+ 
++@app.post("/api/projects/{slug}/tasks/{task_id}/resume")
++async def project_task_resume(slug: str, task_id: int):
++    """Resume a workflow paused by workflow.phases[].pause_after or auto-pause."""
++    return _resume_paused_workflow(slug, task_id)
++
++
++@app.post("/api/projects/{slug}/phases/resume")
++async def project_phase_resume(slug: str, payload: dict):
++    """Body-compatible phase resume endpoint for workflow callers."""
++    task_id = payload.get("task_id")
++    if task_id is None:
++        return JSONResponse({"error": "task_id required"}, status_code=400)
++    try:
++        task_id = int(task_id)
++    except Exception:
++        return JSONResponse({"error": "task_id must be an integer"}, status_code=400)
++    return _resume_paused_workflow(slug, task_id)
++
++
+ @app.post("/api/projects/{slug}/tasks")
+ async def project_task_add(slug: str, payload: dict):
+     """Add a task to a project. Body: {title, assignee?, status?, notes?, source?}.
+@@ -2476,16 +2637,75 @@ async def project_task_update(slug: str, task_id: int, payload: dict):
+     if idx is None:
+         return {"error": f"task {task_id} not found"}
+     task = dict(tasks[idx])
++    status_changed = False
+     for k in ("title", "assignee", "notes"):
+         if k in payload: task[k] = payload[k]
+     if "status" in payload and payload["status"] in TASK_STATUSES:
++        status_changed = task.get("status") != payload["status"]
+         task["status"] = payload["status"]
+     task["updated"] = _dt.datetime.now().isoformat(timespec="seconds")
+     tasks[idx] = task
+     fm = dict(pr["_frontmatter"])
+     fm["tasks"] = tasks
++    wf = fm.get("workflow") or {}
++    auto_pause = None
++    if "status" in payload and payload["status"] in TASK_STATUSES and wf.get("active_task_id") == task_id:
++        if task.get("status") == "blocked":
++            try:
++                count = int(wf.get("consecutive_blocked_count") or 0) + 1
++            except Exception:
++                count = 1
++            reason = (payload.get("notes") or task.get("notes") or "(no blocker note)").strip()
++            reasons = [str(r) for r in (wf.get("last_blocked_reasons") or []) if str(r).strip()]
++            reasons = (reasons + [reason])[-2:]
++            wf["consecutive_blocked_count"] = count
++            wf["last_blocked_reasons"] = reasons
++
++            try:
++                threshold = int(wf.get("auto_pause_threshold") or 2)
++            except Exception:
++                threshold = 2
++            if count >= max(1, threshold) and wf.get("phase_state") != "paused_for_review":
++                phase = wf.get("active_phase")
++                wf["phase_state"] = "paused_for_review"
++                wf["pause_reason"] = "auto-paused after 2 consecutive blocked replies"
++                event = _record_phase_event(
++                    "auto-paused",
++                    slug,
++                    wf,
++                    task_id,
++                    phase,
++                    f"auto-paused task #{task_id} after {count} consecutive blocked replies",
++                    {
++                        "reasons": reasons,
++                        "reporting_agent": payload.get("agent") or task.get("assignee") or None,
++                    },
++                )
++                rendered_reasons = "; ".join(f"{i + 1}) {r}" for i, r in enumerate(reasons))
++                auto_pause = {
++                    "event": event,
++                    "message": (
++                        f"@user Task #{task_id} auto-paused after {count} consecutive blocked replies. "
++                        f"Reasons: {rendered_reasons}. Resume via Define → Projects or "
++                        f"`POST /api/projects/{slug}/tasks/{task_id}/resume`."
++                    ),
++                }
++        else:
++            if wf.get("phase_state") == "paused_for_review" and wf.get("pause_reason"):
++                wf["phase_state"] = "working"
++            _reset_blocked_pause_counters(wf)
++        fm["workflow"] = wf
+     _write_vault_page(PROJECTS_DIR, slug, fm, pr.get("body") or "")
+-    return {"ok": True, "task": task}
++    if auto_pause:
++        channel = (pr.get("channels") or ["general"])[0]
++        await _post_system_notice(channel, auto_pause["message"])
++    return {
++        "ok": True,
++        "task": task,
++        "status_changed": status_changed,
++        "auto_paused": bool(auto_pause),
++        "workflow": fm.get("workflow"),
++    }
+ 
+ 
+ @app.delete("/api/projects/{slug}/tasks/{task_id}")

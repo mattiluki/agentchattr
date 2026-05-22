@@ -1,0 +1,50 @@
+diff --git a/serve.py b/serve.py
+index 86217ba..33cfa72 100644
+--- a/serve.py
++++ b/serve.py
+@@ -2638,6 +2638,36 @@ async def project_task_update(slug: str, task_id: int, payload: dict):
+         return {"error": f"task {task_id} not found"}
+     task = dict(tasks[idx])
+     status_changed = False
++    requested_status = payload.get("status")
++    current_status = task.get("status")
++    wf = (pr.get("_frontmatter") or {}).get("workflow") or {}
++    if requested_status == "in_progress":
++        if current_status == "blocked":
++            return JSONResponse(
++                {"error": "task is blocked; resolve first", "task_id": task_id},
++                status_code=409,
++            )
++        if current_status == "in_progress":
++            return JSONResponse(
++                {"error": "task already in progress", "task_id": task_id},
++                status_code=409,
++            )
++        active_task_id = wf.get("active_task_id")
++        phase_state = wf.get("phase_state")
++        if active_task_id and active_task_id != task_id and phase_state != "idle":
++            active_phase = _phase_by_name(wf, wf.get("active_phase"))
++            requested_agent = payload.get("agent") or payload.get("assignee")
++            if requested_agent and requested_agent == active_phase.get("agent"):
++                pass
++            else:
++                return JSONResponse(
++                    {
++                        "error": "workflow busy",
++                        "active_task_id": active_task_id,
++                        "phase_state": phase_state,
++                    },
++                    status_code=409,
++                )
+     for k in ("title", "assignee", "notes"):
+         if k in payload: task[k] = payload[k]
+     if "status" in payload and payload["status"] in TASK_STATUSES:
+@@ -2691,6 +2721,8 @@ async def project_task_update(slug: str, task_id: int, payload: dict):
+                     ),
+                 }
+         else:
++            if wf.get("phase_state") == "paused_for_review" and wf.get("pause_reason"):
++                wf["phase_state"] = "working"
+             _reset_blocked_pause_counters(wf)
+         fm["workflow"] = wf
+     _write_vault_page(PROJECTS_DIR, slug, fm, pr.get("body") or "")
