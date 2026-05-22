@@ -1,0 +1,375 @@
+diff --git a/serve.py b/serve.py
+index 6f3fcc8..cd8beef 100644
+--- a/serve.py
++++ b/serve.py
+@@ -6241,15 +6241,58 @@ async def quick_generate(payload: dict):
+     })
+ 
+ 
++def _parse_audit_window(spec: str | None) -> float | None:
++    """Parse ISO8601 or relative `-Ns/m/h/d` into epoch seconds; None if blank/invalid."""
++    if not spec:
++        return None
++    import re as _re, time as _t
++    m = _re.match(r"^-(\d+)([smhd])$", spec.strip())
++    if m:
++        n, unit = int(m.group(1)), m.group(2)
++        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
++        return _t.time() - n * mult
++    try:
++        import datetime as _dt
++        return _dt.datetime.fromisoformat(spec).timestamp()
++    except Exception:
++        return None
++
++
++def _audit_entry_ts_epoch(entry: dict) -> float:
++    """Best-effort ISO→epoch for an audit entry's ts field. Returns 0 on failure."""
++    ts = entry.get("ts") or ""
++    if not ts:
++        return 0.0
++    try:
++        import datetime as _dt
++        return _dt.datetime.fromisoformat(ts).timestamp()
++    except Exception:
++        return 0.0
++
++
+ @app.get("/api/audit")
+-async def audit_log(limit: int = 50):
++async def audit_log(
++    limit: int = 100,
++    since: str | None = None,
++    until: str | None = None,
++    kind: str | None = None,
++    agent: str | None = None,
++    q: str | None = None,
++):
+     """Unified audit feed — merges:
+       - HITL log (07-Meta/log.md) approval/rejection entries
+       - Inbox pending proposals
+       - Recent chat activity (system + agentos-moderator messages across channels)
+       - Scheduler fires
+       - Stale-registry sweeps + agent restarts (from serve.py log)
+-    Returns newest-first."""
++    Returns newest-first.
++
++    Filters (all optional, combined with AND):
++      since/until: ISO8601 (`2026-05-22T16:00:00`) or relative (`-1h`, `-24h`, `-7d`)
++      kind:        comma-separated, e.g. `hitl,scheduler`
++      agent:       exact match on entry.agent
++      q:           case-insensitive substring across kind/agent/channel/target/operation/summary
++    """
+     import time as _t
+     out = []
+ 
+@@ -6366,9 +6409,49 @@ async def audit_log(limit: int = 50):
+         pass
+ 
+     out.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
++
++    since_ep = _parse_audit_window(since)
++    until_ep = _parse_audit_window(until)
++    kinds = {k.strip() for k in kind.split(",")} if kind else None
++    agent_match = agent.strip() if agent else None
++    q_lower = q.lower().strip() if q else None
++
++    if since_ep or until_ep or kinds or agent_match or q_lower:
++        def _keep(e: dict) -> bool:
++            if kinds and e.get("kind") not in kinds:
++                return False
++            if agent_match and e.get("agent") != agent_match:
++                return False
++            if since_ep or until_ep:
++                ep = _audit_entry_ts_epoch(e)
++                if since_ep and ep and ep < since_ep:
++                    return False
++                if until_ep and ep and ep > until_ep:
++                    return False
++            if q_lower:
++                hay = " ".join(str(e.get(k) or "") for k in (
++                    "kind", "agent", "channel", "target", "operation", "summary", "verdict", "phase", "project"
++                )).lower()
++                if q_lower not in hay:
++                    return False
++            return True
++        out = [e for e in out if _keep(e)]
++
+     return out[:limit]
+ 
+ 
++@app.get("/api/audit/agents")
++async def audit_agents():
++    """Distinct agent names across the last 500 audit entries (for filter dropdowns)."""
++    entries = await audit_log(limit=500)
++    seen: set[str] = set()
++    for e in entries:
++        a = e.get("agent")
++        if a and a != "?" and isinstance(a, str):
++            seen.add(a)
++    return sorted(seen)
++
++
+ @app.get("/api/scheduler/status")
+ async def scheduler_status():
+     """Show what the scheduler will fire next."""
+diff --git a/ui-static/screens/audit.jsx b/ui-static/screens/audit.jsx
+index 39b02cf..e652d9e 100644
+--- a/ui-static/screens/audit.jsx
++++ b/ui-static/screens/audit.jsx
+@@ -4,18 +4,91 @@
+ // model fallbacks, and system-channel messages. Live feed from /api/audit.
+ // Replaces the legacy "coming soon" placeholder.
+ 
++const AUDIT_TIME_OPTIONS = [
++  { label: "Last 1h",  value: "-1h" },
++  { label: "Last 6h",  value: "-6h" },
++  { label: "Last 24h", value: "-24h" },
++  { label: "Last 7d",  value: "-7d" },
++  { label: "All time", value: "" },
++];
++
++function _readAuditHash() {
++  if (typeof location === "undefined" || !location.hash) return {};
++  try {
++    const raw = location.hash.replace(/^#\/?audit\??/, "").replace(/^#/, "");
++    const sp = new URLSearchParams(raw);
++    return {
++      since:  sp.get("since")  || "-24h",
++      kind:   sp.get("kind")   || "",
++      agent:  sp.get("agent")  || "",
++      q:      sp.get("q")      || "",
++    };
++  } catch {
++    return {};
++  }
++}
++
++function _writeAuditHash(state) {
++  if (typeof location === "undefined") return;
++  const sp = new URLSearchParams();
++  if (state.since && state.since !== "-24h") sp.set("since", state.since);
++  if (state.kind)  sp.set("kind",  state.kind);
++  if (state.agent) sp.set("agent", state.agent);
++  if (state.q)     sp.set("q",     state.q);
++  const tail = sp.toString();
++  const newHash = tail ? `#audit?${tail}` : "";
++  if (location.hash !== newHash) history.replaceState(null, "", location.pathname + location.search + newHash);
++}
++
++function _auditJumpUrl(e) {
++  const kind = e.kind || "";
++  if (kind === "hitl" || kind === "inbox-pending") {
++    return `#inbox${e.target ? `?q=${encodeURIComponent(e.target)}` : ""}`;
++  }
++  if (kind === "scheduler" || kind === "system-message") {
++    return e.channel ? `#chat?channel=${encodeURIComponent(e.channel)}` : null;
++  }
++  if (kind && kind.startsWith("phase")) {
++    const parts = [];
++    if (e.project) parts.push(`project=${encodeURIComponent(e.project)}`);
++    if (e.task_id) parts.push(`task=${e.task_id}`);
++    return parts.length ? `#define?${parts.join("&")}` : null;
++  }
++  if (kind === "registry-sweep" || kind === "model-fallback") {
++    return e.agent ? `#fleet?agent=${encodeURIComponent(e.agent)}` : "#fleet";
++  }
++  return null;
++}
++
+ function AuditScreen() {
++  const initial = _readAuditHash();
+   const [entries, setEntries] = React.useState([]);
+-  const [filter, setFilter]   = React.useState("all");
++  const [agents,  setAgents]  = React.useState([]);
++  const [since,   setSince]   = React.useState(initial.since || "-24h");
++  const [filter,  setFilter]  = React.useState(initial.kind  || "all");
++  const [agent,   setAgent]   = React.useState(initial.agent || "");
++  const [q,       setQ]       = React.useState(initial.q     || "");
++  const [qDeferred, setQDeferred] = React.useState(initial.q || "");
+   const [loading, setLoading] = React.useState(false);
+ 
++  // Debounce search input (300ms) to avoid hammering the endpoint per keystroke.
++  React.useEffect(() => {
++    const t = setTimeout(() => setQDeferred(q), 300);
++    return () => clearTimeout(t);
++  }, [q]);
++
+   const load = React.useCallback(() => {
+     setLoading(true);
+-    fetch("/api/audit?limit=100")
++    const sp = new URLSearchParams({ limit: "100" });
++    if (since)          sp.set("since", since);
++    if (filter !== "all") sp.set("kind", filter);
++    if (agent)          sp.set("agent", agent);
++    if (qDeferred)      sp.set("q", qDeferred);
++    fetch(`/api/audit?${sp.toString()}`)
+       .then(r => r.json())
+       .then(d => { setEntries(Array.isArray(d) ? d : []); setLoading(false); })
+       .catch(() => setLoading(false));
+-  }, []);
++  }, [since, filter, agent, qDeferred]);
+ 
+   React.useEffect(() => {
+     load();
+@@ -23,8 +96,22 @@ function AuditScreen() {
+     return () => clearInterval(t);
+   }, [load]);
+ 
++  React.useEffect(() => {
++    fetch("/api/audit/agents")
++      .then(r => r.json())
++      .then(d => setAgents(Array.isArray(d) ? d : []))
++      .catch(() => {});
++  }, []);
++
++  React.useEffect(() => {
++    _writeAuditHash({ since, kind: filter === "all" ? "" : filter, agent, q: qDeferred });
++  }, [since, filter, agent, qDeferred]);
++
+   const kinds = Array.from(new Set(entries.map(e => e.kind))).sort();
+-  const visible = filter === "all" ? entries : entries.filter(e => e.kind === filter);
++
++  const clearAll = () => {
++    setSince("-24h"); setFilter("all"); setAgent(""); setQ(""); setQDeferred("");
++  };
+ 
+   const kindColor = {
+     "hitl":            "#10b981",
+@@ -43,6 +130,11 @@ function AuditScreen() {
+     "system-message":  "📢",
+   };
+ 
++  const ctrlStyle = {
++    padding:"4px 8px",border:"1px solid var(--line-strong)",borderRadius:5,
++    background:"var(--bg-sunken)",color:"var(--ink-2)",fontSize:11,fontFamily:"var(--mono)",
++  };
++
+   return (
+     <div className="screen">
+       <div style={{padding:"14px 20px",borderBottom:"1px solid var(--line)",display:"flex",alignItems:"center",gap:12}}>
+@@ -57,6 +149,29 @@ function AuditScreen() {
+         }}>{loading ? "loading…" : "refresh"}</button>
+       </div>
+ 
++      <div style={{padding:"8px 20px",display:"flex",gap:8,alignItems:"center",borderBottom:"1px solid var(--line)",flexWrap:"wrap"}}>
++        <label className="mono muted" style={{fontSize:10,textTransform:"uppercase",letterSpacing:0.06}}>time</label>
++        <select value={since} onChange={e => setSince(e.target.value)} style={ctrlStyle}>
++          {AUDIT_TIME_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
++        </select>
++
++        <label className="mono muted" style={{fontSize:10,textTransform:"uppercase",letterSpacing:0.06,marginLeft:6}}>agent</label>
++        <select value={agent} onChange={e => setAgent(e.target.value)} style={ctrlStyle}>
++          <option value="">all agents</option>
++          {agents.map(a => <option key={a} value={a}>{a}</option>)}
++        </select>
++
++        <input
++          type="search" placeholder="search…" value={q}
++          onChange={e => setQ(e.target.value)}
++          style={{...ctrlStyle,minWidth:200,marginLeft:6}}
++        />
++
++        <button onClick={clearAll} className="mono" style={{
++          ...ctrlStyle,cursor:"pointer",color:"var(--muted)",marginLeft:"auto",
++        }}>clear filters</button>
++      </div>
++
+       <div style={{padding:"10px 20px",display:"flex",gap:6,flexWrap:"wrap",borderBottom:"1px solid var(--line)"}}>
+         <button onClick={() => setFilter("all")} className="mono" style={{
+           padding:"3px 10px",borderRadius:999,
+@@ -79,47 +194,55 @@ function AuditScreen() {
+       </div>
+ 
+       <div style={{overflowY:"auto",padding:"6px 0"}}>
+-        {visible.length === 0 && (
+-          <div className="muted" style={{padding:"40px",textAlign:"center"}}>no entries</div>
++        {entries.length === 0 && (
++          <div className="muted" style={{padding:"40px",textAlign:"center"}}>no entries match the current filters</div>
+         )}
+-        {visible.map((e, i) => (
+-          <div key={i} style={{
+-            display:"flex",alignItems:"baseline",gap:12,padding:"6px 20px",
+-            borderBottom:"1px solid var(--line)",
+-            fontSize:12.5,
+-          }}>
+-            <span className="mono" style={{
+-              minWidth:140,fontSize:10.5,color:"var(--muted)",
+-            }}>{e.ts}</span>
+-            <span style={{
+-              minWidth:90,fontSize:10,padding:"1px 7px",borderRadius:999,
+-              background: (kindColor[e.kind] || "var(--muted)")+"22",
+-              color: kindColor[e.kind] || "var(--muted)",
+-              fontFamily:"var(--mono)",fontWeight:700,letterSpacing:0.04,
+-              textTransform:"uppercase",textAlign:"center",
+-            }}>{kindIcon[e.kind] || "•"} {e.kind}</span>
+-            {e.agent && (
+-              <span className="mono" style={{fontSize:10.5,color:"var(--ink-2)",minWidth:80}}>@{e.agent}</span>
+-            )}
+-            {e.channel && (
+-              <span className="mono" style={{fontSize:10.5,color:"var(--muted)",minWidth:80}}>#{e.channel}</span>
+-            )}
+-            {e.target && (
+-              <span className="mono" style={{fontSize:10.5,color:"var(--ink-2)",minWidth:200}}>{e.target}</span>
+-            )}
+-            {e.operation && (
+-              <span className="mono" style={{fontSize:10.5,color:"var(--accent)",minWidth:80}}>{e.operation}</span>
+-            )}
+-            {e.verdict && (
++        {entries.map((e, i) => {
++          const jump = _auditJumpUrl(e);
++          return (
++            <div key={i} style={{
++              display:"flex",alignItems:"baseline",gap:12,padding:"6px 20px",
++              borderBottom:"1px solid var(--line)",
++              fontSize:12.5,
++            }}>
+               <span className="mono" style={{
+-                fontSize:10,padding:"1px 6px",borderRadius:3,
+-                background: e.verdict==="applied" ? "#10b98122" : e.verdict==="rejected" ? "#dc262622" : "#f59e0b22",
+-                color:      e.verdict==="applied" ? "#10b981"   : e.verdict==="rejected" ? "#dc2626"   : "#f59e0b",
+-              }}>{e.verdict}</span>
+-            )}
+-            <span style={{flex:1,color:"var(--ink-2)"}}>{e.summary}</span>
+-          </div>
+-        ))}
++                minWidth:140,fontSize:10.5,color:"var(--muted)",
++              }}>{e.ts}</span>
++              <span style={{
++                minWidth:90,fontSize:10,padding:"1px 7px",borderRadius:999,
++                background: (kindColor[e.kind] || "var(--muted)")+"22",
++                color: kindColor[e.kind] || "var(--muted)",
++                fontFamily:"var(--mono)",fontWeight:700,letterSpacing:0.04,
++                textTransform:"uppercase",textAlign:"center",
++              }}>{kindIcon[e.kind] || "•"} {e.kind}</span>
++              {e.agent && (
++                <span className="mono" style={{fontSize:10.5,color:"var(--ink-2)",minWidth:80}}>@{e.agent}</span>
++              )}
++              {e.channel && (
++                <span className="mono" style={{fontSize:10.5,color:"var(--muted)",minWidth:80}}>#{e.channel}</span>
++              )}
++              {e.target && (
++                <span className="mono" style={{fontSize:10.5,color:"var(--ink-2)",minWidth:200}}>{e.target}</span>
++              )}
++              {e.operation && (
++                <span className="mono" style={{fontSize:10.5,color:"var(--accent)",minWidth:80}}>{e.operation}</span>
++              )}
++              {e.verdict && (
++                <span className="mono" style={{
++                  fontSize:10,padding:"1px 6px",borderRadius:3,
++                  background: e.verdict==="applied" ? "#10b98122" : e.verdict==="rejected" ? "#dc262622" : "#f59e0b22",
++                  color:      e.verdict==="applied" ? "#10b981"   : e.verdict==="rejected" ? "#dc2626"   : "#f59e0b",
++                }}>{e.verdict}</span>
++              )}
++              <span style={{flex:1,color:"var(--ink-2)"}}>{e.summary}</span>
++              {jump && (
++                <a href={jump} title="jump to context" className="mono" style={{
++                  fontSize:11,color:"var(--accent)",textDecoration:"none",padding:"0 4px",
++                }}>↗</a>
++              )}
++            </div>
++          );
++        })}
+       </div>
+     </div>
+   );
