@@ -1,0 +1,317 @@
+diff --git a/serve.py b/serve.py
+index cd8beef..ae62692 100644
+--- a/serve.py
++++ b/serve.py
+@@ -2601,6 +2601,147 @@ async def project_phase_events(slug: str, limit: int = 50):
+     return _read_phase_events(limit, slug)
+ 
+ 
++@app.get("/api/projects/{slug}/timeline")
++async def project_timeline(slug: str, limit_tasks: int = 30):
++    """Group phase-events into per-task Plan→Build→Review cycles with durations,
++    agent assignments, and commits. Returns newest-task-first.
++
++    Shape:
++      [{task_id, task_title, task_status, is_active, phases: [{name, agent,
++        started_at, finished_at, duration_sec, status, commits: [{repo, sha,
++        status, repo_path?}], last_event_kind, event_count}]}]
++    """
++    import time as _t
++    from collections import defaultdict
++
++    pr = _read_vault_page(PROJECTS_DIR, slug, PROJECT_EXTRA_FIELDS)
++    if not pr:
++        return JSONResponse(status_code=404, content={"error": "project not found"})
++
++    wf = (pr.get("_frontmatter") or {}).get("workflow") or pr.get("workflow") or {}
++    canonical_phases = [p for p in (wf.get("phases") or []) if p.get("name")]
++    canonical_names = [p["name"] for p in canonical_phases]
++    if not canonical_names:
++        canonical_names = ["Plan", "Build", "Review"]
++        canonical_phases = [{"name": n, "agent": wf.get("coordinator_agent")} for n in canonical_names]
++    default_agent = {p["name"]: p.get("agent") for p in canonical_phases}
++    active_task_id = wf.get("active_task_id")
++    active_phase_name = wf.get("active_phase")
++
++    tasks_by_id = {t.get("id"): t for t in (pr.get("tasks") or []) if t.get("id") is not None}
++
++    events = _read_phase_events(2000, slug)
++    by_task: dict[int, list[dict]] = defaultdict(list)
++    for ev in events:
++        tid = ev.get("task_id")
++        if tid is None:
++            continue
++        by_task[tid].append(ev)
++
++    out: list[dict] = []
++    now_iso = _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(_t.time()))
++    for task_id, task_events in by_task.items():
++        task_events.sort(key=lambda e: str(e.get("ts") or ""))
++
++        phases_payload = []
++        for idx, phase_name in enumerate(canonical_names):
++            phase_events = [e for e in task_events if e.get("phase") == phase_name]
++            if not phase_events:
++                is_active_no_events = (task_id == active_task_id and phase_name == active_phase_name)
++                phases_payload.append({
++                    "name": phase_name,
++                    "agent": default_agent.get(phase_name),
++                    "started_at": None,
++                    "finished_at": None,
++                    "duration_sec": None,
++                    "status": "in_progress" if is_active_no_events else "pending",
++                    "commits": [],
++                    "last_event_kind": None,
++                    "event_count": 0,
++                })
++                continue
++
++            started_at = phase_events[0].get("ts")
++            next_phase_name = canonical_names[idx + 1] if idx + 1 < len(canonical_names) else None
++            if next_phase_name:
++                next_events = [e for e in task_events if e.get("phase") == next_phase_name]
++                finished_at = next_events[0].get("ts") if next_events else phase_events[-1].get("ts")
++            else:
++                finished_at = phase_events[-1].get("ts")
++
++            is_active_phase = (task_id == active_task_id and phase_name == active_phase_name)
++            task_done = (task_meta_lookup := tasks_by_id.get(task_id) or {}).get("status") in ("done", "cancelled")
++            task_blocked = task_meta_lookup.get("status") == "blocked"
++            committed = any(e.get("kind") in ("phase-committed", "phase-approved") for e in phase_events)
++            if is_active_phase:
++                phase_status = "in_progress"
++                finished_at_for_duration = now_iso
++            elif task_done:
++                phase_status = "done"
++                finished_at_for_duration = finished_at
++            elif task_blocked:
++                phase_status = "blocked" if committed else "pending"
++                finished_at_for_duration = finished_at
++            elif committed:
++                phase_status = "done"
++                finished_at_for_duration = finished_at
++            else:
++                phase_status = "pending"
++                finished_at_for_duration = finished_at
++
++            start_ep = _audit_entry_ts_epoch({"ts": started_at})
++            end_ep = _audit_entry_ts_epoch({"ts": finished_at_for_duration})
++            duration_sec = int(end_ep - start_ep) if (start_ep and end_ep and end_ep >= start_ep) else None
++
++            commits_seen: set[tuple] = set()
++            commits: list[dict] = []
++            for e in phase_events:
++                for c in (e.get("commits") or []):
++                    key = (c.get("repo"), c.get("sha"))
++                    if key in commits_seen:
++                        continue
++                    commits_seen.add(key)
++                    commits.append({
++                        "repo": c.get("repo"),
++                        "sha": c.get("sha"),
++                        "status": c.get("status"),
++                    })
++
++            phase_agent = None
++            for e in phase_events:
++                if e.get("agent") and e.get("agent") != "user":
++                    phase_agent = e["agent"]
++                    break
++            if not phase_agent:
++                phase_agent = default_agent.get(phase_name)
++
++            phases_payload.append({
++                "name": phase_name,
++                "agent": phase_agent,
++                "started_at": started_at,
++                "finished_at": finished_at,
++                "duration_sec": duration_sec,
++                "status": phase_status,
++                "commits": commits,
++                "last_event_kind": phase_events[-1].get("kind"),
++                "event_count": len(phase_events),
++            })
++
++        last_ts = task_events[-1].get("ts") or ""
++        task_meta = tasks_by_id.get(task_id) or {}
++        out.append({
++            "task_id": task_id,
++            "task_title": task_meta.get("title"),
++            "task_status": task_meta.get("status"),
++            "is_active": task_id == active_task_id,
++            "last_event_ts": last_ts,
++            "phases": phases_payload,
++        })
++
++    out.sort(key=lambda r: r["last_event_ts"], reverse=True)
++    return out[:limit_tasks]
++
++
+ @app.post("/api/projects/{slug}/phase-events/{event_ts}/revert")
+ async def project_phase_event_revert(slug: str, event_ts: str):
+     import subprocess as _sp
+diff --git a/ui-static/screens/workflows.jsx b/ui-static/screens/workflows.jsx
+index 9561dca..c99834d 100644
+--- a/ui-static/screens/workflows.jsx
++++ b/ui-static/screens/workflows.jsx
+@@ -137,6 +137,160 @@ function WorkflowsScreen({ onSelectAgent, onNavigate }) {
+           />
+         </div>
+       )}
++
++      {focused && (
++        <WorkflowTimelineView projectSlug={focused.project_slug} />
++      )}
++    </div>
++  );
++}
++
++function _formatTimelineDuration(sec) {
++  if (sec == null) return "—";
++  if (sec < 60) return `${sec}s`;
++  if (sec < 3600) return `${Math.floor(sec/60)}m ${sec%60}s`;
++  if (sec < 86400) return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
++  return `${Math.floor(sec/86400)}d ${Math.floor((sec%86400)/3600)}h`;
++}
++
++const TIMELINE_PHASE_STATUS_COLORS = {
++  "in_progress": "#3fb950",
++  "done":        "#10b981",
++  "blocked":     "#f59e0b",
++  "pending":     "#6b7280",
++};
++
++function WorkflowTimelineView({ projectSlug }) {
++  const [rows, setRows]       = React.useState([]);
++  const [loading, setLoading] = React.useState(false);
++  const [error, setError]     = React.useState("");
++
++  const load = React.useCallback(() => {
++    if (!projectSlug) return;
++    setLoading(true);
++    fetch(`/api/projects/${encodeURIComponent(projectSlug)}/timeline?limit_tasks=30`)
++      .then(r => r.json())
++      .then(d => {
++        if (Array.isArray(d)) { setRows(d); setError(""); }
++        else { setRows([]); setError(d?.error || "unknown error"); }
++        setLoading(false);
++      })
++      .catch(e => { setError(String(e).slice(0,120)); setLoading(false); });
++  }, [projectSlug]);
++
++  React.useEffect(() => {
++    load();
++    const t = setInterval(load, 30000);
++    return () => clearInterval(t);
++  }, [load]);
++
++  return (
++    <div style={{
++      marginTop: 20, padding: "14px 16px",
++      border: "1px solid var(--line)", borderRadius: 8,
++      background: "var(--bg-sunken)",
++    }}>
++      <div style={{display:"flex",alignItems:"baseline",gap:10,marginBottom:10}}>
++        <div style={{fontWeight:700,fontSize:13}}>Timeline · {projectSlug}</div>
++        <div className="mono muted" style={{fontSize:11}}>
++          {rows.length} task{rows.length===1?"":"s"} · Plan → Build → Review · server-side groupBy from phase-events
++        </div>
++        <div style={{flex:1}} />
++        <button onClick={load} disabled={loading} className="mono" style={{
++          padding:"4px 10px",border:"1px solid var(--line-strong)",borderRadius:5,
++          background:"transparent",color:"var(--ink-2)",cursor:"pointer",fontSize:11,
++        }}>{loading ? "loading…" : "refresh"}</button>
++      </div>
++
++      {error && (
++        <div className="mono" style={{fontSize:11,color:"#dc2626",marginBottom:8}}>error: {error}</div>
++      )}
++
++      {rows.length === 0 && !loading && !error && (
++        <div className="muted" style={{padding:"30px 0",textAlign:"center",fontSize:12}}>
++          No task cycles recorded yet. Phase events will appear here as tasks progress through Plan → Build → Review.
++        </div>
++      )}
++
++      {rows.map(row => (
++        <TimelineTaskRow key={row.task_id} row={row} />
++      ))}
++    </div>
++  );
++}
++
++function TimelineTaskRow({ row }) {
++  return (
++    <div style={{
++      display:"grid",
++      gridTemplateColumns:"minmax(220px, 1.2fr) repeat(auto-fit, minmax(180px, 1fr))",
++      gap:10, padding:"10px 0",
++      borderTop:"1px solid var(--line)",
++      alignItems:"stretch",
++    }}>
++      <div style={{display:"flex",flexDirection:"column",gap:4,paddingRight:8}}>
++        <div className="mono" style={{fontSize:11,color:"var(--muted)"}}>
++          #{row.task_id}{row.is_active ? " · ACTIVE" : ""}
++        </div>
++        <div style={{fontSize:12.5,fontWeight:row.is_active ? 700 : 500,color:"var(--ink-1)",lineHeight:1.3}}>
++          {row.task_title || "(untitled)"}
++        </div>
++        <div className="mono" style={{
++          fontSize:10,marginTop:2,padding:"1px 7px",borderRadius:3,alignSelf:"flex-start",
++          background: row.task_status === "done" ? "#10b98122" : row.task_status === "blocked" ? "#f59e0b22" : "#6b728022",
++          color:      row.task_status === "done" ? "#10b981"   : row.task_status === "blocked" ? "#f59e0b"   : "#6b7280",
++          textTransform:"uppercase",letterSpacing:0.04,fontWeight:700,
++        }}>{row.task_status || "?"}</div>
++      </div>
++
++      {(row.phases || []).map((p, i) => (
++        <TimelinePhaseCell key={`${row.task_id}-${p.name}-${i}`} phase={p} isActive={row.is_active && p.status === "in_progress"} />
++      ))}
++    </div>
++  );
++}
++
++function TimelinePhaseCell({ phase, isActive }) {
++  const color = TIMELINE_PHASE_STATUS_COLORS[phase.status] || "var(--muted)";
++  return (
++    <div style={{
++      padding:"8px 10px",borderRadius:6,
++      background: isActive ? `${color}11` : "var(--bg-1)",
++      border: isActive ? `1px solid ${color}` : "1px solid var(--line)",
++      display:"flex",flexDirection:"column",gap:4,minHeight:80,
++    }}>
++      <div style={{display:"flex",alignItems:"center",gap:6}}>
++        <span style={{
++          width:7,height:7,borderRadius:"50%",background:color,
++          boxShadow: isActive ? `0 0 0 3px ${color}33` : "none",
++        }} />
++        <span style={{fontWeight:700,fontSize:12}}>{phase.name}</span>
++        <span className="mono" style={{fontSize:10,color:"var(--muted)",marginLeft:"auto"}}>@{phase.agent || "?"}</span>
++      </div>
++      <div style={{display:"flex",alignItems:"baseline",gap:8}}>
++        <span className="mono" style={{fontSize:10,color,fontWeight:700,textTransform:"uppercase",letterSpacing:0.04}}>
++          {phase.status}
++        </span>
++        <span className="mono" style={{fontSize:10,color:"var(--muted)"}}>
++          {_formatTimelineDuration(phase.duration_sec)}
++        </span>
++      </div>
++      {phase.commits && phase.commits.length > 0 && (
++        <div style={{display:"flex",flexWrap:"wrap",gap:3,marginTop:2}}>
++          {phase.commits.map((c, ci) => (
++            <span key={ci} className="mono" title={`${c.repo} · ${c.status || "?"}`} style={{
++              fontSize:9.5,padding:"1px 5px",borderRadius:3,
++              background:"var(--bg-sunken)",color:"var(--ink-2)",
++              border:"1px solid var(--line)",
++            }}>{(c.repo || "?").slice(0,12)} {(c.sha || "").slice(0,7)}</span>
++          ))}
++        </div>
++      )}
++      {phase.last_event_kind && (
++        <div className="mono" style={{fontSize:9.5,color:"var(--muted)",marginTop:"auto"}}>
++          last: {phase.last_event_kind} ({phase.event_count} ev)
++        </div>
++      )}
+     </div>
+   );
+ }
