@@ -42,24 +42,23 @@ api_key_env = "MOONSHOT_API_KEY"
 temperature = 0.6
 
 [agents.qwen]
-type = "api"
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-model = "qwen-plus"
+command = "qwen"
 cwd = ".."
 color = "#8b5cf6"
 label = "Qwen"
-api_key_env = "DASHSCOPE_API_KEY"
-temperature = 0.6
+mcp_inject = "settings_file"
+mcp_settings_path = ".qwen/settings.json"
+mcp_transport = "http"
 
-[agents.kilo]
-type = "api"
-base_url = "https://openrouter.ai/api/v1"
-model = "qwen/qwen3-coder"
-cwd = ".."
-color = "#f7f677"
-label = "Kilo"
-api_key_env = "OPENROUTER_API_KEY"
-temperature = 0.4
+# [agents.kilo]
+# type = "api"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "qwen/qwen3-coder"
+# cwd = ".."
+# color = "#f7f677"
+# label = "Kilo"
+# api_key_env = "OPENROUTER_API_KEY"
+# temperature = 0.4
 
 [agents.minimax]
 type = "api"
@@ -70,14 +69,14 @@ label = "MiniMax"
 api_key_env = "MINIMAX_API_KEY"
 temperature = 1.0
 
-[agents.openrouter]
-type = "api"
-base_url = "https://openrouter.ai/api/v1"
-model = "openai/gpt-oss-120b"
-color = "#ff7a1a"
-label = "OpenRouter"
-api_key_env = "OPENROUTER_API_KEY"
-temperature = 0.7
+# [agents.openrouter]
+# type = "api"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "openai/gpt-oss-120b"
+# color = "#ff7a1a"
+# label = "OpenRouter"
+# api_key_env = "OPENROUTER_API_KEY"
+# temperature = 0.7
 
 [agents.hermes]
 type = "api"
@@ -159,15 +158,16 @@ max_size_mb = 10
 #   "flag"          — write a config file, pass via CLI flag (mcp_flag, default: --mcp-config)
 #   "proxy_flag"    — start a local proxy, pass URL via CLI flag template
 #
-# Example: Qwen Code CLI
-#   [agents.qwen]
-#   command = "qwen"
-#   cwd = ".."
-#   color = "#8b5cf6"
-#   label = "Qwen"
-#   mcp_inject = "settings_file"
-#   mcp_settings_path = ".qwen/settings.json"
-#   mcp_transport = "http"
+# Example: Qwen Code CLI (already defined above — DO NOT duplicate)
+# [agents.qwen]
+# command = "qwen"
+# cwd = ".."
+# color = "#8b5cf6"
+# label = "Qwen"
+# mcp_inject = "settings_file"
+# mcp_settings_path = ".qwen/settings.json"
+# mcp_transport = "http"
+
 #
 # Example: CLI with env var for settings
 #   [agents.mycli]
