@@ -81,7 +81,7 @@ temperature = 1.0
 [agents.hermes]
 type = "api"
 base_url = "https://openrouter.ai/api/v1"
-model = "nousresearch/hermes-3-llama-3.1-405b"
+model = "nvidia/nemotron-3-super-120b-a12b:free"
 color = "#d946ef"
 label = "Hermes"
 api_key_env = "OPENROUTER_API_KEY"
@@ -190,3 +190,6 @@ max_size_mb = 10
 #   # system_prompt = "You are ..."   # optional: custom system prompt
 #
 # Then run: python wrapper_api.py qwen
+
+# [agents.openclaw] — TUI needs TTY (fails headless), one-shot too slow (timeout). Use via MCP/standalone instead.
+# command = "/Users/zeroclaw/.local/bin/openclaw-fleet.sh"

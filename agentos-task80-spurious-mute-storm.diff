@@ -1,0 +1,113 @@
+diff --git a/serve.py b/serve.py
+index 7692034..ccd675d 100644
+--- a/serve.py
++++ b/serve.py
+@@ -14,6 +14,7 @@ Stage 3+ planned:    WebSocket /ws/agents/{id} via tmux capture-pane;
+ 
+ import asyncio
+ import logging
++import os
+ import re
+ import subprocess
+ import sys
+@@ -4889,14 +4890,15 @@ async def _scheduler_loop():
+ # over-posting agent to wait. State tracked in memory + JSON file.
+ #
+ # Mechanism:
+-#  - Listener task connects to agentchattr WS and tracks every message.
+-#  - For agent senders: increment consecutive count for (channel, agent).
++#  - Listener task connects to agentchattr WS, skips the initial history replay,
++#    and tracks only live chat messages from agent senders.
++#  - For real agent chat senders: increment consecutive count for (channel, agent).
+ #  - When count >= CONSECUTIVE_CAP: mute_until_ts = now + FALLBACK_MUTE_SEC,
+ #    post system notice "⛔ AGENTOS MUTE: @X — pause until another agent
+-#    replies (or 10 min)".
++#    replies (or 10 min)", then reset the consecutive count.
+ #  - When ANY DIFFERENT agent posts in same channel: reset others'
+ #    consecutive count to 0; if any were muted by event-trigger (not manual),
+-#    unmute and post "🔓 @X unmuted".
++#    unmute silently.
+ #  - Manual mute via /api/mute/{channel}/{agent} ignores agent traffic and
+ #    survives until explicitly cleared or its timer expires.
+ 
+@@ -4904,6 +4906,7 @@ MUTE_STATE_FILE = Path(__file__).parent / ".agent-mute-state.json"
+ AGENT_SENDERS = {"claude", "codex", "gemini", "kimi", "qwen", "kilo", "minimax"}
+ CONSECUTIVE_CAP = 3
+ FALLBACK_MUTE_SEC = 600  # 10 min — agent stays muted if nobody else posts
++MUTE_NOTICE_COOLDOWN_SEC = int(os.environ.get("AGENTOS_MUTE_NOTICE_COOLDOWN_SEC", "60"))
+ _mute_state: dict = {}   # {channel: {agent: {consecutive, muted_until_ts, muted_manual}}}
+ 
+ 
+@@ -4941,7 +4944,19 @@ async def _post_system_notice(channel: str, text: str):
+         log.warning(f"mute notice post failed: {e}")
+ 
+ 
+-async def _handle_agent_post(channel: str, sender: str):
++def _is_agent_chat_message(msg: dict) -> bool:
++    """Only real persisted chat messages from agent clients count as agent posts."""
++    if (msg.get("type") or "chat") != "chat":
++        return False
++    sender = msg.get("sender")
++    return sender in AGENT_SENDERS
++
++
++def _has_real_post_since(st: dict, ts: float) -> bool:
++    return float(st.get("last_real_post_ts") or 0) > float(ts or 0)
++
++
++async def _handle_agent_post(channel: str, sender: str, msg: dict | None = None):
+     import time as _t
+     now = _t.time()
+     chan_state = _mute_state.setdefault(channel, {})
+@@ -4962,15 +4977,25 @@ async def _handle_agent_post(channel: str, sender: str):
+ 
+     # This sender's count
+     st = chan_state.setdefault(sender, {"consecutive": 0, "muted_until_ts": 0, "muted_manual": False})
++    st["last_real_post_ts"] = now
+     if st.get("muted_until_ts", 0) > now:
+         log.warning(f"mute violation: {sender} posted in #{channel} while muted (manual={st.get('muted_manual')})")
++        _save_mute_state()
++        return
+     st["consecutive"] = st.get("consecutive", 0) + 1
+ 
+     if st["consecutive"] >= CONSECUTIVE_CAP and st.get("muted_until_ts", 0) <= now:
++        last_notice_ts = float(st.get("last_mute_notice_ts") or 0)
++        if now - last_notice_ts < MUTE_NOTICE_COOLDOWN_SEC and not _has_real_post_since(st, last_notice_ts):
++            _save_mute_state()
++            return
+         st["muted_until_ts"] = now + FALLBACK_MUTE_SEC
+         st["muted_manual"] = False
+         st["muted_at"] = now
++        st["last_mute_notice_ts"] = now
+         st["mute_reason"] = f"{CONSECUTIVE_CAP} consecutive posts"
++        # Reset after emitting the notice so every future mute requires a fresh 3-post window.
++        st["consecutive"] = 0
+         await _post_system_notice(channel,
+             f"⛔ AGENTOS MUTE: @{sender} — {CONSECUTIVE_CAP} posts in a row in #{channel}. "
+             f"Pausing you until another agent replies (or {FALLBACK_MUTE_SEC // 60} min fallback). "
+@@ -4996,18 +5021,23 @@ async def _mute_listener():
+             url = f"ws://127.0.0.1:8300/ws?token={token}"
+             async with _wsc.connect(url) as ws:
+                 log.info("mute-listener: connected to agentchattr WS")
++                replaying_history = True
+                 async for raw in ws:
+                     try:
+                         evt = _j.loads(raw)
+                     except Exception:
+                         continue
++                    if replaying_history:
++                        if evt.get("type") == "status":
++                            replaying_history = False
++                        continue
+                     if evt.get("type") != "message":
+                         continue
+                     msg = evt.get("data") or {}
+                     sender = msg.get("sender")
+                     channel = msg.get("channel") or "general"
+-                    if sender in AGENT_SENDERS:
+-                        await _handle_agent_post(channel, sender)
++                    if _is_agent_chat_message(msg):
++                        await _handle_agent_post(channel, sender, msg)
+         except Exception as e:
+             log.warning(f"mute-listener disconnected: {e}; retry in 10s")
+             await _aio.sleep(10)

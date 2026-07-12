@@ -1,0 +1,73 @@
+diff --git a/agents/orchestrator.py b/agents/orchestrator.py
+index cb54b59..4969a5d 100644
+--- a/agents/orchestrator.py
++++ b/agents/orchestrator.py
+@@ -161,6 +161,20 @@ def _agent_posted_since(channel: str, agent: str, since_ts: float) -> bool:
+     return False
+ 
+ 
++def _clear_workflow_focus(workflow: dict, reason: str) -> None:
++    """Reset active workflow pointers while preserving configured phases."""
++    workflow["active_task_id"] = None
++    workflow["active_phase"] = None
++    workflow["phase_state"] = "idle"
++    workflow["pending_review_path"] = None
++    workflow["pause_reason"] = reason
++    workflow["last_pulse_key"] = None
++    workflow["last_pulse_ts"] = 0
++    workflow["pulse_repeat_count"] = 0
++    workflow["consecutive_blocked_count"] = 0
++    workflow["last_blocked_reasons"] = []
++
++
+ def pulse_once():
+     """One iteration: figure out what to ping, ping it."""
+     project = get_project(PROJECT_SLUG)
+@@ -171,7 +185,8 @@ def pulse_once():
+     workflow = project.get("workflow") or {}
+     channels = project.get("channels") or ["agenos-dev"]
+     channel = channels[0]
+-    open_tasks = [t for t in (project.get("tasks") or []) if t.get("status") in ("open", "in_progress")]
++    tasks = project.get("tasks") or []
++    open_tasks = [t for t in tasks if t.get("status") in ("open", "in_progress")]
+ 
+     if not workflow.get("enabled"):
+         # Seed default workflow + ask claude to refine if needed
+@@ -189,18 +204,29 @@ def pulse_once():
+             f"For now, I'll start pulsing tasks through these phases.")
+         return
+ 
+-    if not open_tasks:
+-        log.info("no open/in-progress tasks — pulse skipped")
+-        # Optionally ping claude to add more tasks
+-        post_chat(channel,
+-            f"@claude · {PROJECT_SLUG} has no open tasks. If the roadmap still has "
+-            f"work to do, please add a few next-up tasks using task_add MCP tool.")
+-        return
+-
+     # Pick the active task: honor workflow.active_task_id first (lets manual
+     # advance survive agent zombie re-marks). Otherwise prefer in_progress,
+     # else first open by id.
+     pinned_id = workflow.get("active_task_id")
++    if pinned_id:
++        pinned_task = next((t for t in tasks if t.get("id") == pinned_id), None)
++        pinned_is_open = pinned_task and pinned_task.get("status") in ("open", "in_progress")
++        if not pinned_is_open:
++            reason = (
++                f"cleared stale active_task_id={pinned_id}: "
++                f"{'task not found' if pinned_task is None else 'task status is ' + repr(pinned_task.get('status'))}"
++            )
++            log.warning(reason)
++            _clear_workflow_focus(workflow, reason)
++            if not update_project_workflow(PROJECT_SLUG, workflow):
++                log.warning("failed to clear stale workflow pointer — skipping pulse")
++                return
++            pinned_id = None
++
++    if not open_tasks:
++        log.info("no open/in-progress tasks — pulse skipped")
++        return
++
+     task = None
+     if pinned_id:
+         for t in open_tasks:

@@ -1,0 +1,166 @@
+diff --git a/agents/orchestrator.py b/agents/orchestrator.py
+index d358e0e..1ebe4f1 100644
+--- a/agents/orchestrator.py
++++ b/agents/orchestrator.py
+@@ -141,6 +141,108 @@ def _primary_agent(phase: dict) -> str:
+     return phase.get("agent", "claude")
+ 
+ 
++def _read_md_frontmatter(path: pathlib.Path) -> dict:
++    """Small frontmatter reader for artifact detection; avoids depending on yaml."""
++    try:
++        text = path.read_text(encoding="utf-8")
++    except (OSError, UnicodeDecodeError):
++        return {}
++    if not text.startswith("---\n"):
++        return {}
++    end = text.find("\n---\n", 4)
++    if end == -1:
++        return {}
++    fm: dict = {}
++    for raw in text[4:end].splitlines():
++        if ":" not in raw:
++            continue
++        key, value = raw.split(":", 1)
++        fm[key.strip()] = value.strip().strip('"').strip("'")
++    return fm
++
++
++def _phase_artifact_exists(phase: dict, task: dict, task_slug: str) -> bool:
++    """Detect phase artifacts when output_hint is the generic HITL placeholder.
++
++    Build/Review phases write conventional vault artifacts, but their
++    output_hint is often only "<via propose_change to HITL>". Detect by
++    task_id frontmatter first, then by slug+agent filename as a fallback.
++    """
++    hint = str(phase.get("output_hint") or "")
++    if "via propose_change" not in hint.lower():
++        return _output_exists(hint, task_slug)
++
++    pname = str(phase.get("name") or "").lower()
++    if pname == "build":
++        subdir = "builds"
++        agent = _primary_agent(phase)
++    elif pname == "review":
++        subdir = "reviews"
++        agent = _primary_agent(phase) or "gemini"
++    else:
++        return False
++
++    root = pathlib.Path.home() / "Documents" / "obsidian" / "LosAgentOS" / "04-Wiki" / subdir
++    if not root.exists():
++        return False
++    task_id = str(task.get("id") or "")
++    agent_base = str(agent).split("-", 1)[0]
++    for path in root.glob("*.md"):
++        fm = _read_md_frontmatter(path)
++        if task_id and str(fm.get("task_id") or "") == task_id:
++            artifact_agent = str(fm.get("builder") or fm.get("reviewer") or "")
++            if not artifact_agent or artifact_agent.split("-", 1)[0] == agent_base:
++                return True
++
++    fallback = root / f"{task_slug}__{agent_base}.md"
++    return fallback.exists()
++
++
++def _sender_base(sender: str) -> str:
++    return str(sender or "").split("-", 1)[0].lower()
++
++
++def _coordinator_manual_phase_complete(channel: str, coordinator: str, task_id, phase_name: str) -> bool:
++    """Coordinator escape hatch for placeholder phases whose artifacts are odd.
++
++    Accepts a recent message such as "As Coordinator: #80 Build phase is
++    COMPLETE" from claude/claude-1/etc. This is intentionally narrow so ordinary
++    discussion does not advance a phase by accident.
++    """
++    import re as _re
++
++    q = urllib.parse.quote(channel)
++    msgs = _http("GET", f"/api/chat/messages?channel={q}&limit=100") or []
++    cutoff = time.time() - 3600
++    coord_base = _sender_base(coordinator or "claude")
++    pattern = _re.compile(
++        rf"^(?:As Coordinator:\s*)?#?{_re.escape(str(task_id))}\s+"
++        rf"{_re.escape(str(phase_name))}\s+phase\s+is\s+(?:COMPLETE|done)\.?\s*$",
++        _re.IGNORECASE,
++    )
++    for m in msgs:
++        if _sender_base(str(m.get("sender", ""))) != coord_base:
++            continue
++        try:
++            if float(m.get("timestamp") or 0) < cutoff:
++                continue
++        except (TypeError, ValueError):
++            continue
++        text = str(m.get("text") or "")
++        if pattern.match(text.strip()):
++            return True
++    return False
++
++
++def _phase_complete(phase: dict, task: dict, task_slug: str, channel: str, coordinator: str) -> bool:
++    if _phase_artifact_exists(phase, task, task_slug):
++        return True
++    hint = str(phase.get("output_hint") or "")
++    if "via propose_change" not in hint.lower():
++        return False
++    return _coordinator_manual_phase_complete(channel, coordinator, task.get("id"), phase.get("name", ""))
++
++
+ def _output_exists(hint: str, task_slug: str) -> bool:
+     """Heuristic completion check: does the expected output file exist in vault?"""
+     if not hint or "<" not in hint:
+@@ -336,7 +438,10 @@ def _drive_task(slug: str, task_id) -> None:
+         return
+ 
+     st = _task_state(workflow, task_id)
+-    task_slug = (task.get("title") or "").lower().replace(" ", "-")[:40]
++    # Path-safe slug: spaces and path separators → '-'. The '/' guard matters —
++    # a title like "Replay/rollback" otherwise yields a phantom subdir in the
++    # expected-output path and the phase output is never detected (stalls Plan).
++    task_slug = (task.get("title") or "").lower().replace(" ", "-").replace("/", "-")[:40]
+     phases = workflow.get("phases") or DEFAULT_PHASES
+     coordinator = workflow.get("coordinator_agent", "claude")
+     auto_approve = workflow.get("coordinator_auto_approve", True)
+@@ -352,7 +457,7 @@ def _drive_task(slug: str, task_id) -> None:
+     # Current phase = first phase whose expected output doesn't exist yet.
+     current_phase = None
+     for ph in phases:
+-        if not _output_exists(ph.get("output_hint", ""), task_slug):
++        if not _phase_complete(ph, task, task_slug, channel, coordinator):
+             current_phase = ph
+             break
+ 
+@@ -394,7 +499,7 @@ def _drive_task(slug: str, task_id) -> None:
+         if ph.get("name") == current_phase.get("name"):
+             break
+         prev_phase = ph
+-    if prev_phase and _output_exists(prev_phase.get("output_hint", ""), task_slug) \
++    if prev_phase and _phase_complete(prev_phase, task, task_slug, channel, coordinator) \
+             and st.get("active_phase") == prev_phase.get("name") \
+             and st.get("phase_state") == "working":
+         log.info(f"[{slug}] phase {prev_phase.get('name')!r} completed on task #{task_id} (auto_approve={auto_approve})")
+@@ -447,13 +552,19 @@ def _drive_task(slug: str, task_id) -> None:
+     last_ts   = float(st.get("last_pulse_ts") or 0)
+     repeat    = int(st.get("pulse_repeat_count") or 0)
+ 
+-    if last_key == pulse_key and any(_agent_posted_since(channel, t, last_ts) for t in targets):
+-        # Someone responded — they're working. Reset the silence counter, no re-pulse.
++    # "Engaged" = a target posted RECENTLY (within one pulse interval), not merely
++    # at any point since the last pulse. The floor is max(last_ts, now-interval):
++    # last_ts guards against treating a pre-pulse message as a response, while
++    # now-interval guards against a single stale ack suppressing re-pulses forever
++    # (which previously dead-stalled tasks once an agent acked then went quiet).
++    activity_floor = max(last_ts, time.time() - PULSE_INTERVAL_SEC)
++    if last_key == pulse_key and any(_agent_posted_since(channel, t, activity_floor) for t in targets):
++        # Someone responded recently — they're working. Reset silence counter, no re-pulse.
+         if repeat:
+             st["pulse_repeat_count"] = 0
+             _mirror_legacy(workflow, task_id, st)
+             update_project_workflow(slug, workflow)
+-        log.info(f"[{slug}] target(s) {targets} active since last pulse on {pulse_key} — skip re-pulse")
++        log.info(f"[{slug}] target(s) {targets} active within last pulse interval on {pulse_key} — skip re-pulse")
+         return
+ 
+     repeat = repeat + 1 if last_key == pulse_key else 0
