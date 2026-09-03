@@ -39,6 +39,17 @@ def _check_tmux():
     sys.exit(1)
 
 
+def _kill_session(session_name: str):
+    try:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            capture_output=True,
+            timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  Warning: tmux kill-session timed out for {session_name}")
+
+
 def inject(text: str, *, tmux_session: str, delay: float = 0.3):
     """Send text + Enter to a tmux session via send-keys."""
     # Use -l to send text literally (avoids misinterpreting as key names),
@@ -132,10 +143,7 @@ def run_agent(
     while True:
         try:
             # Clean up stale session from a previous crash
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
-                capture_output=True,
-            )
+            _kill_session(session_name)
 
             # Create tmux session running the agent CLI
             result = subprocess.run(
@@ -169,8 +177,5 @@ def run_agent(
             time.sleep(3)
         except KeyboardInterrupt:
             # Kill the tmux session on Ctrl+C
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
-                capture_output=True,
-            )
+            _kill_session(session_name)
             break

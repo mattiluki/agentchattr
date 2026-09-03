@@ -188,7 +188,7 @@ def _install_security_middleware(token: str, cfg: dict):
                 return await call_next(request)
 
             # Agent registration/heartbeat: loopback only (no remote agent minting).
-            if path.startswith(("/api/register", "/api/deregister/", "/api/heartbeat/")):
+            if path.startswith(("/api/register", "/api/deregister/", "/api/heartbeat/", "/api/renames")):
                 client_ip = request.client.host if request.client else ""
                 if client_ip not in ("127.0.0.1", "::1", "localhost"):
                     return JSONResponse(
@@ -2126,6 +2126,21 @@ async def register_agent(request: Request):
         })
         asyncio.run_coroutine_threadsafe(_broadcast(pending_event), _event_loop)
     return JSONResponse(result)
+
+
+@app.get("/api/renames")
+async def get_renames():
+    """Local wrapper sanity check: expose current rename redirects."""
+    return JSONResponse({"renames": registry.get_renames() if registry else {}})
+
+
+@app.delete("/api/renames/{name}")
+async def delete_rename(name: str):
+    """Local wrapper sanity check: clear a stale rename chain rooted at name."""
+    if not registry:
+        return JSONResponse({"ok": False}, status_code=503)
+    changed = registry.delete_rename_chain(name)
+    return JSONResponse({"ok": True, "changed": changed})
 
 
 @app.post("/api/deregister/{name}")

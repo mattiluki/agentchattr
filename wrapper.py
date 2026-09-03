@@ -411,6 +411,184 @@ def _register_instance(server_port: int, base: str, label: str | None = None) ->
         return json.loads(reg_resp.read())
 
 
+def _activity_report_path(data_dir: Path, agent_name: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in agent_name)
+    return data_dir / f"activity_report_{safe}.log"
+
+
+def _log_ghost_sweep(data_dir: Path, agent_name: str, message: str):
+    line = f"[{time.strftime('%H:%M:%S')}] ghost-sweep {message}"
+    print(f"  {line}")
+    try:
+        with _activity_report_path(data_dir, agent_name).open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _run_tmux(args: list[str], *, timeout: float = 3.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["tmux", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _tmux_session_activity(session_name: str) -> float | None:
+    try:
+        result = _run_tmux(["display-message", "-p", "-t", session_name, "#{session_activity}"])
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _tmux_session_exists(session_name: str) -> bool:
+    try:
+        return _run_tmux(["has-session", "-t", session_name]).returncode == 0
+    except Exception:
+        return False
+
+
+def _tmux_session_is_stale(session_name: str, ttl_sec: float, *, now: float | None = None) -> tuple[bool, float | None]:
+    activity = _tmux_session_activity(session_name)
+    if activity is None:
+        return False, None
+    return ((now if now is not None else time.time()) - activity > ttl_sec, activity)
+
+
+def _tmux_agent_sessions(agent: str) -> list[str]:
+    try:
+        result = _run_tmux(["list-sessions", "-F", "#{session_name}"])
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    base = f"agentchattr-{agent}"
+    prefix = f"{base}-"
+    sessions = []
+    for raw in result.stdout.splitlines():
+        name = raw.strip()
+        if name == base:
+            sessions.append(name)
+            continue
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        if suffix.isdigit():
+            sessions.append(name)
+    return sessions
+
+
+def _ghost_sweep_tmux_sessions(data_dir: Path, agent: str):
+    if sys.platform == "win32" or shutil.which("tmux") is None:
+        return
+    if os.getenv("AGENTCHATTR_GHOST_SWEEP", "0").lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        ttl_sec = float(os.getenv("AGENTCHATTR_GHOST_TTL_SEC", "90"))
+    except ValueError:
+        ttl_sec = 90.0
+    now = time.time()
+    for session_name in _tmux_agent_sessions(agent):
+        stale, activity = _tmux_session_is_stale(session_name, ttl_sec, now=now)
+        if not stale:
+            continue
+        try:
+            result = _run_tmux(["kill-session", "-t", session_name])
+        except Exception as exc:
+            _log_ghost_sweep(data_dir, agent, f"kill failed session={session_name} error={exc}")
+            continue
+        if result.returncode == 0:
+            inactive = int(now - (activity or now))
+            _log_ghost_sweep(data_dir, agent, f"killed session={session_name} inactive_sec={inactive} last_activity={activity}")
+        else:
+            _log_ghost_sweep(data_dir, agent, f"kill failed session={session_name} rc={result.returncode}")
+
+
+def _fetch_renames(server_port: int) -> dict[str, str]:
+    import urllib.request
+
+    req = urllib.request.Request(f"http://127.0.0.1:{server_port}/api/renames")
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        data = json.loads(resp.read())
+    renames = data.get("renames", data)
+    return renames if isinstance(renames, dict) else {}
+
+
+def _delete_rename(server_port: int, name: str):
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server_port}/api/renames/{name}",
+        method="DELETE",
+        data=b"",
+    )
+    urllib.request.urlopen(req, timeout=3).read()
+
+
+def _rename_chain(renames: dict[str, str], root: str) -> list[str]:
+    chain = [root]
+    seen = set()
+    current = root
+    while current in renames and current not in seen:
+        seen.add(current)
+        current = renames[current]
+        chain.append(current)
+    return chain
+
+
+def _registration_needs_rename_cleanup(server_port: int, agent: str, assigned_name: str) -> tuple[bool, list[str]]:
+    if assigned_name == agent or sys.platform == "win32":
+        return False, []
+    renames = _fetch_renames(server_port)
+    chain = _rename_chain(renames, agent)
+    if len(chain) >= 3:
+        return True, chain
+    for name in chain[1:]:
+        session_names = [f"agentchattr-{name}"]
+        if name == f"{agent}-1":
+            session_names.append(f"agentchattr-{agent}")
+        existing = [session_name for session_name in session_names if _tmux_session_exists(session_name)]
+        if not existing:
+            return True, chain
+        stale_results = [
+            _tmux_session_is_stale(
+                session_name,
+                float(os.getenv("AGENTCHATTR_GHOST_TTL_SEC", "90")),
+            )[0]
+            for session_name in existing
+        ]
+        if all(stale_results):
+            return True, chain
+    return False, chain
+
+
+def _register_with_ghost_recovery(server_port: int, agent: str, label: str | None, data_dir: Path) -> dict:
+    _ghost_sweep_tmux_sessions(data_dir, agent)
+    registration = _register_instance(server_port, agent, label)
+    try:
+        needs_cleanup, chain = _registration_needs_rename_cleanup(server_port, agent, registration["name"])
+    except Exception as exc:
+        _log_ghost_sweep(data_dir, agent, f"rename sanity check skipped error={exc}")
+        return registration
+    if not needs_cleanup:
+        return registration
+    _log_ghost_sweep(data_dir, agent, f"clearing stale rename chain={' -> '.join(chain)} assigned={registration['name']}")
+    try:
+        _delete_rename(server_port, agent)
+        return _register_instance(server_port, agent, label)
+    except Exception as exc:
+        _log_ghost_sweep(data_dir, agent, f"rename cleanup retry failed error={exc}; continuing as {registration['name']}")
+        return registration
+
+
 def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
     headers = {"Authorization": f"Bearer {token}"}
     if include_json:
@@ -610,7 +788,7 @@ def main():
     mcp_cfg = config.get("mcp", {})
 
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_with_ghost_recovery(server_port, agent, args.label, data_dir)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Wrapper cannot continue without a registered identity.")
@@ -777,7 +955,7 @@ def main():
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     try:
-                        replacement = _register_instance(server_port, agent, args.label)
+                        replacement = _register_with_ghost_recovery(server_port, agent, args.label, data_dir)
                         set_runtime_identity(replacement["name"], replacement["token"])
                         _notify_recovery(data_dir, replacement["name"])
                     except Exception:

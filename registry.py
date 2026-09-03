@@ -8,6 +8,7 @@ Thread-safe: a single threading.Lock guards all mutations.
 
 import colorsys
 import json
+import os
 import secrets
 import threading
 import time
@@ -103,6 +104,7 @@ class RuntimeRegistry:
                 return None
 
             self._expire_reserved()
+            self._evict_stale_family_members(base)
             self._gc_stale_aliases(base)
 
             # Find next free slot
@@ -496,6 +498,40 @@ class RuntimeRegistry:
                 current = self._renames[current]
             return current
 
+    def get_renames(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._renames)
+
+    def delete_rename_chain(self, name: str) -> bool:
+        """Remove the rename chain rooted at `name` and any backrefs to it."""
+        changed = False
+        with self._lock:
+            chain = []
+            seen = set()
+            current = name
+            while current in self._renames and current not in seen:
+                seen.add(current)
+                chain.append(current)
+                current = self._renames[current]
+            chain_values = set(chain + [current, name])
+            keys_to_delete = set(chain)
+            for old, new in self._renames.items():
+                if old == name or new in chain_values:
+                    keys_to_delete.add(old)
+            if keys_to_delete:
+                self._backup_renames_locked("ghostfix")
+            for key in chain:
+                if key in self._renames:
+                    del self._renames[key]
+                    changed = True
+            for old, new in list(self._renames.items()):
+                if old == name or new in chain_values:
+                    del self._renames[old]
+                    changed = True
+        if changed:
+            self._save_renames()
+        return changed
+
     def is_registered(self, name: str) -> bool:
         with self._lock:
             return name in self._instances
@@ -566,6 +602,41 @@ class RuntimeRegistry:
             for k in stale:
                 del self._renames[k]
         self._save_renames()
+
+    def _instance_ttl_sec(self) -> float:
+        try:
+            return float(os.getenv("AGENTCHATTR_INSTANCE_TTL_SEC", "60"))
+        except ValueError:
+            return 60.0
+
+    def _backup_renames_locked(self, reason: str):
+        """Best-effort backup. Caller must hold the lock."""
+        try:
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            backup = self._renames_path().with_name(f"renames.json.{reason}.{int(time.time())}")
+            backup.write_text(json.dumps(dict(self._renames)), "utf-8")
+        except Exception:
+            pass
+
+    def _evict_stale_family_members(self, base: str):
+        """Evict dead family members before assigning slots. Must hold lock."""
+        now = time.time()
+        ttl = self._instance_ttl_sec()
+        stale = [
+            name for name, inst in self._instances.items()
+            if inst.base == base and now - inst.last_seen > ttl
+        ]
+        if not stale:
+            return
+        self._backup_renames_locked("ghostfix")
+        stale_values = set(stale)
+        for name in stale:
+            del self._instances[name]
+            self._reserved.pop(name, None)
+            self._renames.pop(name, None)
+        for old, new in list(self._renames.items()):
+            if old in stale_values or new in stale_values:
+                del self._renames[old]
 
     def _expire_reserved(self):
         """Remove expired reservations. Must hold lock."""
